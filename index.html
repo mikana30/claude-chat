@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Chat</title>
+<style>
+  :root{--bg:#f6f5f2;--fg:#1c1b19;--muted:#6f6c66;--panel:#fff;--line:#e2dfd8;--me:#dbe8ff;--ai:#fff;--tool:#f0eee8;--err:#b3261e;--accent:#2b5bd7}
+  @media (prefers-color-scheme:dark){:root{--bg:#141414;--fg:#ececec;--muted:#9a9a9a;--panel:#1d1d1d;--line:#2c2c2c;--me:#243a63;--ai:#1d1d1d;--tool:#232323;--err:#ff7b72;--accent:#7aa2ff}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;height:100dvh;display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+  header .spacer{flex:1}
+  button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:8px;padding:6px 12px;cursor:pointer}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button:disabled{opacity:.5;cursor:default}
+  #log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+  .msg{max-width:min(820px,100%);padding:10px 14px;border-radius:12px;white-space:normal;overflow-wrap:anywhere}
+  .me{align-self:flex-end;background:var(--me);white-space:pre-wrap}
+  .ai{align-self:flex-start;background:var(--ai);border:1px solid var(--line)}
+  .ai.status{color:var(--muted);font-style:italic}
+  .ai pre{background:var(--tool);padding:10px;border-radius:8px;overflow-x:auto}
+  .ai code{font-size:13px}
+  .ai p:first-child{margin-top:0}.ai p:last-child{margin-bottom:0}
+  .tool{align-self:flex-start;font-size:12.5px;color:var(--muted);background:var(--tool);border-radius:8px;padding:4px 10px;max-width:min(820px,100%);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+  .tool.err{color:var(--err)}
+  .sys{align-self:center;font-size:12px;color:var(--muted)}
+  .error{align-self:flex-start;color:var(--err);font-size:13px}
+  form{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--panel)}
+  textarea{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);min-height:44px;max-height:200px}
+  #mic.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
+  #voice.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  @keyframes pulse{50%{opacity:.6}}
+  .cursor::after{content:"▍";animation:blink 1s steps(2) infinite;color:var(--muted)}
+  @keyframes blink{to{visibility:hidden}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude Chat</h1>
+  <span class="pill" id="model">…</span>
+  <span class="pill" id="rl" title="Pro plan usage: 5-hour / 7-day windows">usage —</span>
+  <span class="spacer"></span>
+  <button id="voice" title="Read replies aloud; with mic input, auto-sends what you say">🔊 Voice off</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="new">New chat</button>
+</header>
+<div id="log"></div>
+<form id="f">
+  <textarea id="in" placeholder="Message Claude… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+  <button id="mic" type="button" title="Hold a conversation by voice (Chrome)">🎤</button>
+  <button class="primary" id="send" type="submit">Send</button>
+</form>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script>
+const log=document.getElementById('log'),input=document.getElementById('in'),form=document.getElementById('f');
+const sendBtn=document.getElementById('send'),stopBtn=document.getElementById('stop'),newBtn=document.getElementById('new');
+let sessionId=null,controller=null;
+try{sessionId=localStorage.getItem('claude-chat-session')||null}catch(e){}
+
+fetch('/config').then(r=>r.json()).then(c=>{document.getElementById('model').textContent=`${c.model} · effort ${c.effort}`}).catch(()=>{});
+if(sessionId) add('sys','Resumed previous session. Click "New chat" to start fresh.');
+
+function add(cls,text){const d=document.createElement('div');d.className=cls;d.textContent=text;log.appendChild(d);scroll();return d}
+function scroll(){log.scrollTop=log.scrollHeight}
+function render(el,md){
+  if(window.marked){el.innerHTML=marked.parse(md,{breaks:true});}else{el.textContent=md;}
+}
+function setBusy(b){sendBtn.disabled=b;stopBtn.disabled=!b;input.disabled=b;}
+
+function status(el,text){el.classList.add('status');el.textContent=text;scroll();}
+function newBubble(){const d=document.createElement('div');d.className='msg ai cursor';log.appendChild(d);return d;}
+
+// ---- Voice: speech-to-text (Chrome SpeechRecognition) + text-to-speech (speechSynthesis) ----
+const micBtn=document.getElementById('mic'),voiceBtn=document.getElementById('voice');
+const synth=window.speechSynthesis||{cancel(){},speak(){},getVoices(){return[]}};
+let voiceOn=false,recog=null,listening=false,replyText='';
+try{voiceOn=localStorage.getItem('claude-chat-voice')==='1'}catch(e){}
+function setVoice(on){voiceOn=on;voiceBtn.textContent=on?'🔊 Voice on':'🔊 Voice off';voiceBtn.classList.toggle('on',on);try{localStorage.setItem('claude-chat-voice',on?'1':'0')}catch(e){};if(!on)synth.cancel();}
+setVoice(voiceOn);
+voiceBtn.addEventListener('click',()=>setVoice(!voiceOn));
+
+function stripMd(s){
+  return s.replace(/```[\s\S]*?```/g,' code block omitted. ')
+          .replace(/`([^`]*)`/g,'$1').replace(/^#{1,6}\s+/gm,'')
+          .replace(/\*\*|__/g,'').replace(/[*_]/g,'')
+          .replace(/\[([^\]]+)\]\([^)]+\)/g,'$1').replace(/^[-•]\s+/gm,'');
+}
+function speak(text){
+  if(!voiceOn||!('speechSynthesis' in window))return;
+  const t=stripMd(text).trim();if(!t)return;
+  synth.cancel();
+  const u=new SpeechSynthesisUtterance(t);u.rate=1.05;
+  const v=synth.getVoices().find(v=>/en/i.test(v.lang)&&/Google|Natural|Premium/i.test(v.name))||synth.getVoices().find(v=>/en/i.test(v.lang));
+  if(v)u.voice=v;
+  u.onend=()=>{if(voiceOn&&!listening&&!sendBtn.disabled)startListening();};
+  synth.speak(u);
+}
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(!SR){micBtn.disabled=true;micBtn.title='Speech recognition needs Chrome';}
+function startListening(){
+  if(!SR||listening)return;
+  synth.cancel();
+  recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=false;
+  let final='';
+  recog.onresult=e=>{let interim='';for(const r of e.results){if(r.isFinal)final+=r[0].transcript;else interim+=r[0].transcript;}input.value=(final+' '+interim).trim();};
+  recog.onerror=e=>{if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
+  recog.onend=()=>{listening=false;micBtn.classList.remove('listening');recog=null;
+    const t=input.value.trim();
+    if(t&&final.trim()&&voiceOn&&!sendBtn.disabled){input.value='';send(t);}};
+  listening=true;micBtn.classList.add('listening');recog.start();
+}
+function stopListening(){if(recog)recog.stop();}
+micBtn.addEventListener('click',()=>listening?stopListening():startListening());
+
+async function send(text){
+  synth.cancel();replyText='';
+  add('msg me',text);
+  let ai=newBubble(),buf='',t0=Date.now(),gotDone=false;
+  status(ai,'Starting Claude…');
+  const tick=setInterval(()=>{if(ai.classList.contains('status')){const s=Math.round((Date.now()-t0)/1000);ai.textContent=ai.textContent.replace(/( · \d+s)?$/,` · ${s}s`);}},1000);
+  setBusy(true);controller=new AbortController();
+  try{
+    const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,session_id:sessionId}),signal:controller.signal});
+    if(!r.ok){throw new Error('HTTP '+r.status)}
+    const reader=r.body.getReader(),dec=new TextDecoder();let rest='';
+    while(true){
+      const {value,done}=await reader.read();if(done)break;
+      rest+=dec.decode(value,{stream:true});
+      const parts=rest.split('\n\n');rest=parts.pop();
+      for(const p of parts){
+        if(!p.startsWith('data: '))continue;
+        const ev=JSON.parse(p.slice(6));
+        if(ev.type==='started'){status(ai,'Claude is thinking…');}
+        else if(ev.type==='thinking'){if(!buf)status(ai,'Thinking…');}
+        else if(ev.type==='text'){
+          if(ai.classList.contains('status')){ai.classList.remove('status');ai.textContent='';}
+          buf+=ev.text;replyText+=ev.text;render(ai,buf);scroll();
+        }
+        else if(ev.type==='tool'){
+          // close current bubble (if it has text), log the tool, open a fresh bubble for what follows
+          if(buf){ai.classList.remove('cursor');}else{ai.remove();}
+          const t=add('tool','🔧 '+ev.name);t.dataset.name=ev.name;
+          ai=newBubble();buf='';status(ai,'Running '+ev.name+'…');
+        }
+        else if(ev.type==='tool_input'){const tools=[...log.querySelectorAll('.tool')].reverse();const t=tools.find(x=>x.dataset.name===ev.name&&!x.dataset.input);if(t){t.dataset.input='1';t.textContent='🔧 '+ev.name+' '+ev.input;}}
+        else if(ev.type==='tool_result'){
+          const t=add('tool'+(ev.is_error?' err':''),(ev.is_error?'✗ ':'↳ ')+(ev.text||'(no output)'));
+          // keep the pending bubble at the bottom
+          log.appendChild(ai);if(ai.classList.contains('status'))status(ai,'Claude is thinking…');
+        }
+        else if(ev.type==='rl'){const f=Math.round((ev.five_hour||0)*100),s=Math.round((ev.seven_day||0)*100);document.getElementById('rl').textContent=`usage 5h ${f}% · 7d ${s}%`;}
+        else if(ev.type==='error'){add('error',ev.text);}
+        else if(ev.type==='done'){
+          gotDone=true;
+          if(ev.session_id){sessionId=ev.session_id;try{localStorage.setItem('claude-chat-session',sessionId)}catch(e){}}
+          if(ev.is_error&&ev.error){add('error',ev.error);}
+        }
+      }
+    }
+    if(gotDone) speak(replyText);
+    if(!gotDone) add('error','Connection ended before Claude finished (no result event). Check the server log.');
+  }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else add('error',String(e)); }
+  finally{
+    clearInterval(tick);
+    for(const el of log.querySelectorAll('.msg.ai.cursor')){el.classList.remove('cursor');if(el.classList.contains('status')||!el.textContent.trim())el.remove();}
+    setBusy(false);controller=null;input.focus();
+  }
+}
+
+form.addEventListener('submit',e=>{e.preventDefault();const t=input.value.trim();if(!t||sendBtn.disabled)return;input.value='';input.style.height='auto';send(t);});
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
+input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,200)+'px';});
+stopBtn.addEventListener('click',()=>{if(controller)controller.abort();synth.cancel();});
+newBtn.addEventListener('click',()=>{sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
+input.focus();
+</script>
+</body>
+</html>

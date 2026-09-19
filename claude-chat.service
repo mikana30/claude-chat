@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Chat web UI (local, Pro plan via Claude Code CLI)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/claude-chat
+ExecStart=/usr/bin/python3 %h/projects/claude-chat/server.py
+Environment=CHAT_HOST=127.0.0.1
+Environment=CHAT_PORT=8090
+Environment=CHAT_MODEL=claude-fable-5-1
+Environment=CHAT_EFFORT=low
+Environment=CHAT_PERMISSION_MODE=bypassPermissions
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
