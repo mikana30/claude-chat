@@ -8,6 +8,8 @@ chat has everything the terminal has: all built-in tools, every configured MCP s
 - Model: `claude-fable-5-1` at `low` effort (set in the systemd unit or env)
 - Streams replies token by token; shows each tool call and its result inline
 - Pro plan 5-hour / 7-day usage shown in the header
+- Model and effort dropdowns in the header, sent per message and remembered in the
+  browser; the service unit's CHAT_MODEL/CHAT_EFFORT are just the initial defaults
 - Voice: mic input (Chrome speech recognition) and spoken replies, with hands-free
   back-and-forth when Voice is on. Replies are read by a local Piper neural voice
   (dropdown in the header picks the voice; "Browser voice" falls back to Chrome's

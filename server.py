@@ -70,11 +70,14 @@ def preload_voice():
         log(f"tts preload skipped: {e}")
 
 
-def build_cmd(message, session_id):
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def build_cmd(message, session_id, model=None, effort=None):
     cmd = [
         "claude", "-p",
-        "--model", MODEL,
-        "--effort", EFFORT,
+        "--model", model or MODEL,
+        "--effort", effort or EFFORT,
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
@@ -140,7 +143,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         message = (req.get("message") or "").strip()
         session_id = req.get("session_id") or None
-        if not message:
+        model = (req.get("model") or "").strip() or None
+        effort = (req.get("effort") or "").strip() or None
+        if not message or (effort and effort not in EFFORTS) \
+                or (model and not model.replace("-", "").replace(".", "").isalnum()):
             self.send_error(400)
             return
 
@@ -153,9 +159,10 @@ class Handler(BaseHTTPRequestHandler):
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)  # allow spawning from inside a Claude session
         t0 = time.time()
-        proc = subprocess.Popen(build_cmd(message, session_id), cwd=WORKDIR, env=env,
+        proc = subprocess.Popen(build_cmd(message, session_id, model, effort), cwd=WORKDIR, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        log(f"chat start pid={proc.pid} session={session_id} msg={message[:60]!r}")
+        log(f"chat start pid={proc.pid} session={session_id} model={model or MODEL} "
+            f"effort={effort or EFFORT} msg={message[:60]!r}")
         self._sse({"type": "started"})
         self.n_events = 0
         self.got_result = False

@@ -32,6 +32,7 @@
   textarea{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);min-height:44px;max-height:200px}
   #mic.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
   #voice.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  select.pill{font:inherit;font-size:12px;padding:3px 6px;border:1px solid var(--line);border-radius:999px;background:var(--bg);color:var(--fg)}
   #voiceSel{font:inherit;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);max-width:140px}
   @keyframes pulse{50%{opacity:.6}}
   .cursor::after{content:"▍";animation:blink 1s steps(2) infinite;color:var(--muted)}
@@ -41,7 +42,15 @@
 <body>
 <header>
   <h1>Claude Chat</h1>
-  <span class="pill" id="model">…</span>
+  <select id="modelSel" class="pill" title="Model for the next message">
+    <option value="claude-fable-5-1">Fable 5.1</option>
+    <option value="claude-opus-5">Opus 5</option>
+    <option value="claude-sonnet-5">Sonnet 5</option>
+    <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+  </select>
+  <select id="effortSel" class="pill" title="Effort for the next message">
+    <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
+  </select>
   <span class="pill" id="rl" title="Pro plan usage: 5-hour / 7-day windows">usage —</span>
   <span class="spacer"></span>
   <button id="voice" title="Read replies aloud; with mic input, auto-sends what you say">🔊 Voice off</button>
@@ -62,7 +71,15 @@ const sendBtn=document.getElementById('send'),stopBtn=document.getElementById('s
 let sessionId=null,controller=null;
 try{sessionId=localStorage.getItem('claude-chat-session')||null}catch(e){}
 
-fetch('/config').then(r=>r.json()).then(c=>{document.getElementById('model').textContent=`${c.model} · effort ${c.effort}`}).catch(()=>{});
+// Model + effort: per-message overrides, persisted; server defaults fill in until chosen.
+const modelSel=document.getElementById('modelSel'),effortSel=document.getElementById('effortSel');
+function pick(sel,key,val){if(val&&![...sel.options].some(o=>o.value===val)){const o=document.createElement('option');o.value=val;o.textContent=val;sel.appendChild(o);}if(val)sel.value=val;}
+try{pick(modelSel,'m',localStorage.getItem('claude-chat-model'));pick(effortSel,'e',localStorage.getItem('claude-chat-effort'));}catch(e){}
+fetch('/config').then(r=>r.json()).then(c=>{
+  try{if(!localStorage.getItem('claude-chat-model'))pick(modelSel,'m',c.model);if(!localStorage.getItem('claude-chat-effort'))pick(effortSel,'e',c.effort);}catch(e){pick(modelSel,'m',c.model);pick(effortSel,'e',c.effort);}
+}).catch(()=>{});
+modelSel.addEventListener('change',()=>{try{localStorage.setItem('claude-chat-model',modelSel.value)}catch(e){}});
+effortSel.addEventListener('change',()=>{try{localStorage.setItem('claude-chat-effort',effortSel.value)}catch(e){}});
 if(sessionId) add('sys','Resumed previous session. Click "New chat" to start fresh.');
 
 function add(cls,text){const d=document.createElement('div');d.className=cls;d.textContent=text;log.appendChild(d);scroll();return d}
@@ -167,7 +184,7 @@ async function send(text){
   setBusy(true);controller=new AbortController();
   try{
     const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:text,session_id:sessionId}),signal:controller.signal});
+      body:JSON.stringify({message:text,session_id:sessionId,model:modelSel.value,effort:effortSel.value}),signal:controller.signal});
     if(!r.ok){throw new Error('HTTP '+r.status)}
     const reader=r.body.getReader(),dec=new TextDecoder();let rest='';
     while(true){
