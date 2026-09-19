@@ -78,7 +78,7 @@ function newBubble(){const d=document.createElement('div');d.className='msg ai c
 // ---- Voice: speech-to-text (Chrome SpeechRecognition) + text-to-speech (speechSynthesis) ----
 const micBtn=document.getElementById('mic'),voiceBtn=document.getElementById('voice');
 const synth=window.speechSynthesis||{cancel(){},speak(){},getVoices(){return[]}};
-let voiceOn=false,recog=null,listening=false,replyText='';
+let voiceOn=false,recog=null,listening=false,replyText='',speakGen=0,curAudio=null;
 try{voiceOn=localStorage.getItem('claude-chat-voice')==='1'}catch(e){}
 function setVoice(on){voiceOn=on;voiceBtn.textContent=on?'🔊 Voice on':'🔊 Voice off';voiceBtn.classList.toggle('on',on);try{localStorage.setItem('claude-chat-voice',on?'1':'0')}catch(e){};if(!on)stopAudio();}
 setVoice(voiceOn);
@@ -103,7 +103,6 @@ fetch('/voices').then(r=>r.json()).then(j=>{
 voiceSel.addEventListener('change',()=>{voiceName=voiceSel.value;try{localStorage.setItem('claude-chat-voice-name',voiceName)}catch(e){};stopAudio();
   speak('This is the '+voiceSel.options[voiceSel.selectedIndex].textContent+' voice.',true);});
 
-let speakGen=0,curAudio=null;
 function stopAudio(){speakGen++;if(curAudio){curAudio.pause();curAudio=null;}synth.cancel();}
 function afterSpeech(){if(voiceOn&&!listening&&!sendBtn.disabled)startListening();}
 // Split into sentence-sized chunks so the first one plays while the rest synthesize.
