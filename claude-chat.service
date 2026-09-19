@@ -11,6 +11,8 @@ Environment=CHAT_PORT=8090
 Environment=CHAT_MODEL=claude-fable-5-1
 Environment=CHAT_EFFORT=low
 Environment=CHAT_PERMISSION_MODE=bypassPermissions
+Environment=CHAT_VOICE=en_US-lessac-medium
+Environment=CHAT_VOICE_DIR=%h/.local/share/piper-voices
 Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=3

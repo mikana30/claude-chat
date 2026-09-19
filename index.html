@@ -32,6 +32,7 @@
   textarea{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);min-height:44px;max-height:200px}
   #mic.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
   #voice.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  #voiceSel{font:inherit;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);max-width:140px}
   @keyframes pulse{50%{opacity:.6}}
   .cursor::after{content:"▍";animation:blink 1s steps(2) infinite;color:var(--muted)}
   @keyframes blink{to{visibility:hidden}}
@@ -44,6 +45,7 @@
   <span class="pill" id="rl" title="Pro plan usage: 5-hour / 7-day windows">usage —</span>
   <span class="spacer"></span>
   <button id="voice" title="Read replies aloud; with mic input, auto-sends what you say">🔊 Voice off</button>
+  <select id="voiceSel" title="Which voice reads replies"><option value="browser">Browser voice</option></select>
   <button id="stop" disabled>Stop</button>
   <button id="new">New chat</button>
 </header>
@@ -78,7 +80,7 @@ const micBtn=document.getElementById('mic'),voiceBtn=document.getElementById('vo
 const synth=window.speechSynthesis||{cancel(){},speak(){},getVoices(){return[]}};
 let voiceOn=false,recog=null,listening=false,replyText='';
 try{voiceOn=localStorage.getItem('claude-chat-voice')==='1'}catch(e){}
-function setVoice(on){voiceOn=on;voiceBtn.textContent=on?'🔊 Voice on':'🔊 Voice off';voiceBtn.classList.toggle('on',on);try{localStorage.setItem('claude-chat-voice',on?'1':'0')}catch(e){};if(!on)synth.cancel();}
+function setVoice(on){voiceOn=on;voiceBtn.textContent=on?'🔊 Voice on':'🔊 Voice off';voiceBtn.classList.toggle('on',on);try{localStorage.setItem('claude-chat-voice',on?'1':'0')}catch(e){};if(!on)stopAudio();}
 setVoice(voiceOn);
 voiceBtn.addEventListener('click',()=>setVoice(!voiceOn));
 
@@ -88,21 +90,63 @@ function stripMd(s){
           .replace(/\*\*|__/g,'').replace(/[*_]/g,'')
           .replace(/\[([^\]]+)\]\([^)]+\)/g,'$1').replace(/^[-•]\s+/gm,'');
 }
-function speak(text){
-  if(!voiceOn||!('speechSynthesis' in window))return;
-  const t=stripMd(text).trim();if(!t)return;
-  synth.cancel();
+// Voice choice: 'browser' = Chrome speechSynthesis (espeak on Linux); anything else = a Piper model served by /tts.
+const voiceSel=document.getElementById('voiceSel');
+let voiceName='browser';
+try{voiceName=localStorage.getItem('claude-chat-voice-name')||'browser'}catch(e){}
+fetch('/voices').then(r=>r.json()).then(j=>{
+  for(const v of j.voices){const o=document.createElement('option');o.value=v;o.textContent=v.replace(/-medium$|-low$|-high$/,'').replace('_',' ');voiceSel.appendChild(o);}
+  if(voiceName==='browser'&&!localStorage.getItem('claude-chat-voice-name')&&j.default&&j.voices.includes(j.default))voiceName=j.default;
+  if(![...voiceSel.options].some(o=>o.value===voiceName))voiceName='browser';
+  voiceSel.value=voiceName;
+}).catch(()=>{});
+voiceSel.addEventListener('change',()=>{voiceName=voiceSel.value;try{localStorage.setItem('claude-chat-voice-name',voiceName)}catch(e){};stopAudio();
+  speak('This is the '+voiceSel.options[voiceSel.selectedIndex].textContent+' voice.',true);});
+
+let speakGen=0,curAudio=null;
+function stopAudio(){speakGen++;if(curAudio){curAudio.pause();curAudio=null;}synth.cancel();}
+function afterSpeech(){if(voiceOn&&!listening&&!sendBtn.disabled)startListening();}
+// Split into sentence-sized chunks so the first one plays while the rest synthesize.
+function chunkText(t){
+  const parts=t.match(/[^.!?\n]+(?:[.!?]+["')\]]*|\n+|$)/g)||[t];
+  const out=[];let cur='';
+  for(const p of parts){const q=p.trim();if(!q)continue;
+    if(cur&&(cur.length+q.length>220||out.length===0)){out.push(cur);cur='';}
+    cur=cur?cur+' '+q:q;}
+  if(cur)out.push(cur);return out;
+}
+function fetchTts(text){return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,voice:voiceName})}).then(r=>r.ok?r.blob():null).catch(()=>null);}
+function playBlob(blob){return new Promise(res=>{const a=new Audio(URL.createObjectURL(blob));curAudio=a;
+  const fin=()=>{URL.revokeObjectURL(a.src);if(curAudio===a)curAudio=null;res();};a.onended=fin;a.onerror=fin;a.play().catch(fin);});}
+async function speakPiper(t,preview){
+  const gen=speakGen;const parts=chunkText(t);let next=fetchTts(parts[0]);
+  for(let i=0;i<parts.length;i++){
+    const blob=await next;if(gen!==speakGen)return;
+    next=i+1<parts.length?fetchTts(parts[i+1]):null;
+    if(!blob){add('error','Voice: server could not synthesize; falling back to browser voice');speakBrowser(parts.slice(i).join(' '),preview);return;}
+    await playBlob(blob);if(gen!==speakGen)return;
+  }
+  if(!preview)afterSpeech();
+}
+function speakBrowser(t,preview){
+  if(!('speechSynthesis' in window))return;
   const u=new SpeechSynthesisUtterance(t);u.rate=1.05;
   const v=synth.getVoices().find(v=>/en/i.test(v.lang)&&/Google|Natural|Premium/i.test(v.name))||synth.getVoices().find(v=>/en/i.test(v.lang));
   if(v)u.voice=v;
-  u.onend=()=>{if(voiceOn&&!listening&&!sendBtn.disabled)startListening();};
+  if(!preview)u.onend=afterSpeech;
   synth.speak(u);
+}
+function speak(text,preview){
+  if(!voiceOn&&!preview)return;
+  const t=stripMd(text).trim();if(!t)return;
+  stopAudio();
+  if(voiceName==='browser')speakBrowser(t,preview);else speakPiper(t,preview);
 }
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 if(!SR){micBtn.disabled=true;micBtn.title='Speech recognition needs Chrome';}
 function startListening(){
   if(!SR||listening)return;
-  synth.cancel();
+  stopAudio();
   recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=false;
   let final='';
   recog.onresult=e=>{let interim='';for(const r of e.results){if(r.isFinal)final+=r[0].transcript;else interim+=r[0].transcript;}input.value=(final+' '+interim).trim();};
@@ -116,7 +160,7 @@ function stopListening(){if(recog)recog.stop();}
 micBtn.addEventListener('click',()=>listening?stopListening():startListening());
 
 async function send(text){
-  synth.cancel();replyText='';
+  stopAudio();replyText='';
   add('msg me',text);
   let ai=newBubble(),buf='',t0=Date.now(),gotDone=false;
   status(ai,'Starting Claude…');
@@ -174,7 +218,7 @@ async function send(text){
 form.addEventListener('submit',e=>{e.preventDefault();const t=input.value.trim();if(!t||sendBtn.disabled)return;input.value='';input.style.height='auto';send(t);});
 input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
 input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,200)+'px';});
-stopBtn.addEventListener('click',()=>{if(controller)controller.abort();synth.cancel();});
+stopBtn.addEventListener('click',()=>{if(controller)controller.abort();stopAudio();});
 newBtn.addEventListener('click',()=>{sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
 input.focus();
 </script>

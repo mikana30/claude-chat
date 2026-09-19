@@ -8,8 +8,10 @@ chat has everything the terminal has: all built-in tools, every configured MCP s
 - Model: `claude-fable-5-1` at `low` effort (set in the systemd unit or env)
 - Streams replies token by token; shows each tool call and its result inline
 - Pro plan 5-hour / 7-day usage shown in the header
-- Voice: mic input (Chrome speech recognition) and spoken replies (speechSynthesis),
-  with hands-free back-and-forth when Voice is on
+- Voice: mic input (Chrome speech recognition) and spoken replies, with hands-free
+  back-and-forth when Voice is on. Replies are read by a local Piper neural voice
+  (dropdown in the header picks the voice; "Browser voice" falls back to Chrome's
+  speechSynthesis). Sentences stream to the speaker as they are synthesized.
 - Python stdlib only, no pip dependencies
 
 ## Run
@@ -36,5 +38,10 @@ systemctl --user enable --now claude-chat
 ## Requirements
 
 Claude Code CLI logged in (`claude` on PATH), Python 3, Chrome for the voice features.
+
+For the Piper voice: `pip install --user piper-tts`, then drop `*.onnx` + `*.onnx.json`
+voice files from https://huggingface.co/rhasspy/piper-voices into
+`~/.local/share/piper-voices/` (override with `CHAT_VOICE_DIR`; default voice via
+`CHAT_VOICE`). Each loaded voice costs about 150 MB RAM; only one stays loaded.
 The server binds to localhost only and runs with permission prompts bypassed. Don't expose
 it beyond the machine without adding auth.

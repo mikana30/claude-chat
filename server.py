@@ -5,7 +5,7 @@ Runs `claude -p` with the user's full config: all built-in tools, every MCP
 server in the user config (OpenBrain included), CLAUDE.md auto-discovery.
 Streams text deltas and tool activity to the browser as server-sent events.
 """
-import json, os, subprocess, sys, time
+import glob, io, json, os, subprocess, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -26,6 +26,48 @@ APPEND_PROMPT = (
     "work, people, or projects, and mcp__openbrain__remember when Mike asks you to "
     "remember something. Keep replies conversational and short unless asked for depth."
 )
+
+# ---- Text-to-speech: Piper (neural, local). Voices are *.onnx files in VOICE_DIR. ----
+VOICE_DIR = os.environ.get("CHAT_VOICE_DIR", os.path.expanduser("~/.local/share/piper-voices"))
+DEFAULT_VOICE = os.environ.get("CHAT_VOICE", "en_US-lessac-medium")
+_voices = {}                      # name -> PiperVoice; only the most recent one is kept
+_voice_lock = threading.Lock()    # guards model load/unload
+_synth_lock = threading.Lock()    # piper is CPU-bound; one synthesis at a time
+
+
+def list_voices():
+    return sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(VOICE_DIR, "*.onnx")))
+
+
+def get_voice(name):
+    if name not in list_voices():
+        raise ValueError(f"unknown voice {name!r}")
+    with _voice_lock:
+        if name not in _voices:
+            from piper import PiperVoice
+            t0 = time.time()
+            _voices.clear()  # ~150 MB per model; keep memory flat on an 8 GB box
+            _voices[name] = PiperVoice.load(os.path.join(VOICE_DIR, name + ".onnx"))
+            log(f"tts loaded {name} in {time.time()-t0:.1f}s")
+        return _voices[name]
+
+
+def tts_wav(text, name):
+    voice = get_voice(name)
+    buf = io.BytesIO()
+    with _synth_lock:
+        t0 = time.time()
+        with wave.open(buf, "wb") as w:
+            voice.synthesize_wav(text, w)
+        log(f"tts {name} {len(text)} chars {time.time()-t0:.2f}s")
+    return buf.getvalue()
+
+
+def preload_voice():
+    try:
+        get_voice(DEFAULT_VOICE)
+    except Exception as e:  # missing model or piper: TTS endpoint reports it per request
+        log(f"tts preload skipped: {e}")
 
 
 def build_cmd(message, session_id):
@@ -65,6 +107,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(json.dumps({"model": MODEL, "effort": EFFORT, "cwd": WORKDIR,
                                    "permission_mode": PERMISSION_MODE}).encode(),
                        "application/json")
+        elif self.path == "/voices":
+            self._send(json.dumps({"voices": list_voices(), "default": DEFAULT_VOICE}).encode(),
+                       "application/json")
         else:
             self.send_error(404)
 
@@ -73,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_POST(self):
-        if self.path != "/chat":
+        if self.path not in ("/chat", "/tts"):
             self.send_error(404)
             return
         n = int(self.headers.get("Content-Length", "0"))
@@ -81,6 +126,17 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n) or b"{}")
         except json.JSONDecodeError:
             self.send_error(400)
+            return
+        if self.path == "/tts":
+            text = (req.get("text") or "").strip()[:2000]
+            if not text:
+                self.send_error(400)
+                return
+            try:
+                self._send(tts_wav(text, req.get("voice") or DEFAULT_VOICE), "audio/wav")
+            except Exception as e:
+                log(f"tts error: {e}")
+                self.send_error(500, str(e)[:200])
             return
         message = (req.get("message") or "").strip()
         session_id = req.get("session_id") or None
@@ -175,8 +231,9 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
+    threading.Thread(target=preload_voice, daemon=True).start()
     print(f"claude-chat: http://{HOST}:{PORT}  model={MODEL} effort={EFFORT} "
-          f"cwd={WORKDIR} perms={PERMISSION_MODE}", flush=True)
+          f"cwd={WORKDIR} perms={PERMISSION_MODE} voices={list_voices()}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
