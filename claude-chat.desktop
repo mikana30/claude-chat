@@ -3,7 +3,7 @@ Type=Application
 Name=Claude Chat
 Comment=Local Claude chat UI (Fable 5.1, Pro plan)
 Exec=/usr/bin/google-chrome --app=http://127.0.0.1:8090 --class=claude-chat
-Icon=google-chrome
+Icon=claude-chat
 Terminal=false
 Categories=Utility;Chat;
 StartupWMClass=claude-chat

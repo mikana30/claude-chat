@@ -45,3 +45,6 @@ voice files from https://huggingface.co/rhasspy/piper-voices into
 `CHAT_VOICE`). Each loaded voice costs about 150 MB RAM; only one stays loaded.
 The server binds to localhost only and runs with permission prompts bypassed. Don't expose
 it beyond the machine without adding auth.
+
+Dock icon: copy `icon/claude-chat.svg` to `~/.local/share/icons/hicolor/scalable/apps/`
+(and `icon/claude-chat.png` to `.../256x256/apps/`) so `Icon=claude-chat` in the launcher resolves.
