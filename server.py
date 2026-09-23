@@ -72,6 +72,22 @@ def preload_voice():
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
+# Model list comes from Claude Code's own catalog cache, which the CLI refreshes as
+# Anthropic publishes models; read per request so new models show up without a restart.
+CATALOG_GLOB = os.path.expanduser("~/.claude/cache/model-catalog/*-cc.json")
+
+
+def catalog_models():
+    try:
+        path = max(glob.glob(CATALOG_GLOB), key=os.path.getmtime)
+        with open(path) as f:
+            models = json.load(f)["catalog"]["config"]["models"]
+        return [{"id": m["id"], "name": m.get("name") or m["id"], "section": m.get("section", "main")}
+                for m in models if m.get("id")]
+    except (ValueError, OSError, KeyError, TypeError) as e:  # no cache yet or format change: UI keeps its static list
+        log(f"model catalog unavailable: {e}")
+        return []
+
 
 def build_cmd(message, session_id, model=None, effort=None):
     cmd = [
@@ -108,7 +124,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(f.read(), "text/html; charset=utf-8")
         elif self.path == "/config":
             self._send(json.dumps({"model": MODEL, "effort": EFFORT, "cwd": WORKDIR,
-                                   "permission_mode": PERMISSION_MODE}).encode(),
+                                   "permission_mode": PERMISSION_MODE,
+                                   "models": catalog_models()}).encode(),
                        "application/json")
         elif self.path == "/voices":
             self._send(json.dumps({"voices": list_voices(), "default": DEFAULT_VOICE}).encode(),

@@ -77,7 +77,17 @@ try{sessionId=localStorage.getItem('claude-chat-session')||null}catch(e){}
 const modelSel=document.getElementById('modelSel'),effortSel=document.getElementById('effortSel');
 function pick(sel,key,val){if(val&&![...sel.options].some(o=>o.value===val)){const o=document.createElement('option');o.value=val;o.textContent=val;sel.appendChild(o);}if(val)sel.value=val;}
 try{pick(modelSel,'m',localStorage.getItem('claude-chat-model'));pick(effortSel,'e',localStorage.getItem('claude-chat-effort'));}catch(e){}
+// Rebuild the model menu from the server's catalog (newest models first, older ones grouped); the static options are the fallback.
+function setModels(models){
+  if(!models||!models.length)return;
+  const cur=modelSel.value;modelSel.innerHTML='';let older=null;
+  for(const m of models){const o=document.createElement('option');o.value=m.id;o.textContent=m.name;
+    if(m.section==='main')modelSel.appendChild(o);else{if(!older){older=document.createElement('optgroup');older.label='Older';}older.appendChild(o);}}
+  if(older)modelSel.appendChild(older);
+  pick(modelSel,'m',cur);
+}
 fetch('/config').then(r=>r.json()).then(c=>{
+  setModels(c.models);
   try{if(!localStorage.getItem('claude-chat-model'))pick(modelSel,'m',c.model);if(!localStorage.getItem('claude-chat-effort'))pick(effortSel,'e',c.effort);}catch(e){pick(modelSel,'m',c.model);pick(effortSel,'e',c.effort);}
 }).catch(()=>{});
 modelSel.addEventListener('change',()=>{try{localStorage.setItem('claude-chat-model',modelSel.value)}catch(e){}});
