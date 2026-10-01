@@ -5,7 +5,7 @@ It shells out to the Claude Code CLI (`claude -p`) with your normal user config,
 chat has everything the terminal has: all built-in tools, every configured MCP server
 (OpenBrain included), CLAUDE.md, and session resume for multi-turn memory.
 
-- Model: `claude-fable-5-1` at `low` effort (set in the systemd unit or env)
+- Model: `claude-opus-5-5` at `low` effort (set in the systemd unit or env)
 - Streams replies token by token; shows each tool call and its result inline
 - Pro plan 5-hour / 7-day usage shown in the header
 - Model and effort dropdowns in the header, sent per message and remembered in the
