@@ -5,7 +5,8 @@ Runs `claude -p` with the user's full config: all built-in tools, every MCP
 server in the user config (OpenBrain included), CLAUDE.md auto-discovery.
 Streams text deltas and tool activity to the browser as server-sent events.
 """
-import glob, io, json, os, subprocess, sys, threading, time, wave
+import glob, hmac, io, json, os, subprocess, sys, threading, time, wave
+from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -20,12 +21,19 @@ MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("CHAT_EFFORT", "low")
 WORKDIR = os.environ.get("CHAT_CWD", os.path.expanduser("~"))
 PERMISSION_MODE = os.environ.get("CHAT_PERMISSION_MODE", "bypassPermissions")
-APPEND_PROMPT = (
+APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
     "You are chatting with Mike through a web chat UI, not a terminal. "
     "Use OpenBrain (mcp__openbrain__recall) before answering questions about prior "
     "work, people, or projects, and mcp__openbrain__remember when Mike asks you to "
     "remember something. Keep replies conversational and short unless asked for depth."
 )
+# Optional access key. When set (e.g. a copy exposed through Tailscale Funnel),
+# every request needs the key: the first visit carries it as ?t=KEY, which is
+# stored as a long-lived cookie, then the browser is redirected to a clean URL.
+TOKEN = os.environ.get("CHAT_TOKEN", "")
+COOKIE = "cc_key"
+APP_NAME = os.environ.get("CHAT_APP_NAME", "Claude Chat")
+APP_ICON = os.environ.get("CHAT_APP_ICON", "")   # base name in icon/, e.g. "shana" -> shana-any-512.png
 
 # ---- Text-to-speech: Piper (neural, local). Voices are *.onnx files in VOICE_DIR. ----
 VOICE_DIR = os.environ.get("CHAT_VOICE_DIR", os.path.expanduser("~/.local/share/piper-voices"))
@@ -118,10 +126,57 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authed(self):
+        if not TOKEN:
+            return True
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE and hmac.compare_digest(v, TOKEN):
+                return True
+        return False
+
+    def _deny(self):
+        body = b"Not authorized."
+        self.send_response(401)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        url = urlsplit(self.path)
+        if TOKEN and url.path in ("/", "/index.html"):
+            t = (parse_qs(url.query).get("t") or [""])[0]
+            if t and hmac.compare_digest(t, TOKEN):
+                self.send_response(302)
+                self.send_header("Set-Cookie", f"{COOKIE}={TOKEN}; Max-Age=315360000; Path=/; "
+                                 "HttpOnly; Secure; SameSite=Lax")
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        if url.path == "/manifest.json" and APP_ICON:
+            man = {"name": APP_NAME, "short_name": APP_NAME, "start_url": "/", "scope": "/",
+                   "display": "standalone", "background_color": "#101420", "theme_color": "#101420",
+                   "icons": [{"src": f"/icon/{APP_ICON}-any-512.png", "sizes": "512x512",
+                              "type": "image/png", "purpose": "any"},
+                             {"src": f"/icon/{APP_ICON}-maskable-512.png", "sizes": "512x512",
+                              "type": "image/png", "purpose": "maskable"}]}
+            return self._send(json.dumps(man).encode(), "application/manifest+json")
+        if APP_ICON and url.path in (f"/icon/{APP_ICON}-any-512.png", f"/icon/{APP_ICON}-maskable-512.png"):
+            with open(os.path.join(HERE, url.path.lstrip("/")), "rb") as f:
+                return self._send(f.read(), "image/png")
+        if not self._authed():
+            return self._deny()
+        self.path = url.path
         if self.path in ("/", "/index.html"):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
-                self._send(f.read(), "text/html; charset=utf-8")
+                html = f.read()
+            if APP_ICON:
+                html = html.replace(b"<title>Claude Chat</title>",
+                                    f'<title>{APP_NAME}</title><link rel="manifest" href="/manifest.json">'
+                                    f'<meta name="theme-color" content="#101420">'.encode(), 1)
+            self._send(html, "text/html; charset=utf-8")
         elif self.path == "/config":
             self._send(json.dumps({"model": MODEL, "effort": EFFORT, "cwd": WORKDIR,
                                    "permission_mode": PERMISSION_MODE,
@@ -138,6 +193,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def do_POST(self):
+        if not self._authed():
+            return self._deny()
         if self.path not in ("/chat", "/tts"):
             self.send_error(404)
             return
@@ -257,7 +314,7 @@ if __name__ == "__main__":
     srv.daemon_threads = True
     threading.Thread(target=preload_voice, daemon=True).start()
     print(f"claude-chat: http://{HOST}:{PORT}  model={MODEL} effort={EFFORT} "
-          f"cwd={WORKDIR} perms={PERMISSION_MODE} voices={list_voices()}", flush=True)
+          f"cwd={WORKDIR} perms={PERMISSION_MODE} key={'on' if TOKEN else 'off'} voices={list_voices()}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

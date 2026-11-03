@@ -9,7 +9,14 @@
   @media (prefers-color-scheme:dark){:root{--bg:#141414;--fg:#ececec;--muted:#9a9a9a;--panel:#1d1d1d;--line:#2c2c2c;--me:#243a63;--ai:#1d1d1d;--tool:#232323;--err:#ff7b72;--accent:#7aa2ff}}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;height:100dvh;display:flex;flex-direction:column}
-  header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+  header{display:flex;align-items:center;gap:8px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top));border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .iconbtn{padding:6px 10px;line-height:1}
+  #gear.open{background:var(--tool)}
+  #settings{display:none;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  #settings.open{display:flex}
+  #settings label{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  [hidden]{display:none!important}
   header h1{font-size:16px;margin:0;font-weight:600}
   .pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
   header .spacer{flex:1}
@@ -41,28 +48,31 @@
 </head>
 <body>
 <header>
-  <h1>Claude Chat</h1>
-  <select id="modelSel" class="pill" title="Model for the next message">
+  <h1 id="appTitle">Claude Chat</h1>
+  <span class="spacer"></span>
+  <button id="stop" hidden>Stop</button>
+  <button id="new">New chat</button>
+  <button id="gear" class="iconbtn" title="Settings" aria-label="Settings" aria-expanded="false">⚙</button>
+</header>
+<div id="settings">
+  <label>Model <select id="modelSel" class="pill" title="Model for the next message">
     <option value="claude-fable-5-1">Fable 5.1</option>
     <option value="claude-opus-5-5">Opus 5.5</option>
     <option value="claude-sonnet-5-5">Sonnet 5.5</option>
     <option value="claude-opus-5">Opus 5</option>
     <option value="claude-sonnet-5">Sonnet 5</option>
     <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-  </select>
-  <select id="effortSel" class="pill" title="Effort for the next message">
+  </select></label>
+  <label>Effort <select id="effortSel" class="pill" title="Effort for the next message">
     <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
-  </select>
-  <span class="pill" id="rl" title="Pro plan usage: 5-hour / 7-day windows">usage —</span>
-  <span class="spacer"></span>
+  </select></label>
   <button id="voice" title="Read replies aloud; with mic input, auto-sends what you say">🔊 Voice off</button>
   <select id="voiceSel" title="Which voice reads replies"><option value="browser">Browser voice</option></select>
-  <button id="stop" disabled>Stop</button>
-  <button id="new">New chat</button>
-</header>
+  <span class="pill" id="rl" title="Plan usage: 5-hour / 7-day windows">usage —</span>
+</div>
 <div id="log"></div>
 <form id="f">
-  <textarea id="in" placeholder="Message Claude… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+  <textarea id="in" placeholder="Message…" title="Enter to send, Shift+Enter for a new line" rows="1"></textarea>
   <button id="mic" type="button" title="Hold a conversation by voice (Chrome)">🎤</button>
   <button class="primary" id="send" type="submit">Send</button>
 </form>
@@ -71,6 +81,9 @@
 const log=document.getElementById('log'),input=document.getElementById('in'),form=document.getElementById('f');
 const sendBtn=document.getElementById('send'),stopBtn=document.getElementById('stop'),newBtn=document.getElementById('new');
 let sessionId=null,controller=null;
+document.getElementById('appTitle').textContent=document.title||'Claude Chat';
+const gear=document.getElementById('gear'),settings=document.getElementById('settings');
+gear.addEventListener('click',()=>{const o=settings.classList.toggle('open');gear.classList.toggle('open',o);gear.setAttribute('aria-expanded',o);});
 try{sessionId=localStorage.getItem('claude-chat-session')||null}catch(e){}
 
 // Model + effort: per-message overrides, persisted; server defaults fill in until chosen.
@@ -99,7 +112,7 @@ function scroll(){log.scrollTop=log.scrollHeight}
 function render(el,md){
   if(window.marked){el.innerHTML=marked.parse(md,{breaks:true});}else{el.textContent=md;}
 }
-function setBusy(b){sendBtn.disabled=b;stopBtn.disabled=!b;input.disabled=b;}
+function setBusy(b){sendBtn.disabled=b;stopBtn.hidden=!b;input.disabled=b;}
 
 function status(el,text){el.classList.add('status');el.textContent=text;scroll();}
 function newBubble(){const d=document.createElement('div');d.className='msg ai cursor';log.appendChild(d);return d;}
@@ -191,7 +204,7 @@ async function send(text){
   stopAudio();replyText='';
   add('msg me',text);
   let ai=newBubble(),buf='',t0=Date.now(),gotDone=false;
-  status(ai,'Starting Claude…');
+  status(ai,'Working…');
   const tick=setInterval(()=>{if(ai.classList.contains('status')){const s=Math.round((Date.now()-t0)/1000);ai.textContent=ai.textContent.replace(/( · \d+s)?$/,` · ${s}s`);}},1000);
   setBusy(true);controller=new AbortController();
   try{
@@ -206,23 +219,20 @@ async function send(text){
       for(const p of parts){
         if(!p.startsWith('data: '))continue;
         const ev=JSON.parse(p.slice(6));
-        if(ev.type==='started'){status(ai,'Claude is thinking…');}
-        else if(ev.type==='thinking'){if(!buf)status(ai,'Thinking…');}
+        if(ev.type==='started'){status(ai,'Working…');}
+        else if(ev.type==='thinking'){/* thinking stays hidden */}
         else if(ev.type==='text'){
           if(ai.classList.contains('status')){ai.classList.remove('status');ai.textContent='';}
           buf+=ev.text;replyText+=ev.text;render(ai,buf);scroll();
         }
         else if(ev.type==='tool'){
-          // close current bubble (if it has text), log the tool, open a fresh bubble for what follows
-          if(buf){ai.classList.remove('cursor');}else{ai.remove();}
-          const t=add('tool','🔧 '+ev.name);t.dataset.name=ev.name;
-          ai=newBubble();buf='';status(ai,'Running '+ev.name+'…');
+          // Tool use stays hidden: close any text so far and show one quiet placeholder.
+          if(buf){ai.classList.remove('cursor');ai=newBubble();buf='';status(ai,'Working…');}
         }
-        else if(ev.type==='tool_input'){const tools=[...log.querySelectorAll('.tool')].reverse();const t=tools.find(x=>x.dataset.name===ev.name&&!x.dataset.input);if(t){t.dataset.input='1';t.textContent='🔧 '+ev.name+' '+ev.input;}}
+        else if(ev.type==='tool_input'){/* hidden */}
         else if(ev.type==='tool_result'){
-          const t=add('tool'+(ev.is_error?' err':''),(ev.is_error?'✗ ':'↳ ')+(ev.text||'(no output)'));
-          // keep the pending bubble at the bottom
-          log.appendChild(ai);if(ai.classList.contains('status'))status(ai,'Claude is thinking…');
+          // hidden; keep the pending bubble at the bottom
+          log.appendChild(ai);
         }
         else if(ev.type==='rl'){const f=Math.round((ev.five_hour||0)*100),s=Math.round((ev.seven_day||0)*100);document.getElementById('rl').textContent=`usage 5h ${f}% · 7d ${s}%`;}
         else if(ev.type==='error'){add('error',ev.text);}

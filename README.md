@@ -50,3 +50,9 @@ it beyond the machine without adding auth.
 
 Dock icon: copy `icon/claude-chat.svg` to `~/.local/share/icons/hicolor/scalable/apps/`
 (and `icon/claude-chat.png` to `.../256x256/apps/`) so `Icon=claude-chat` in the launcher resolves.
+
+## Optional settings (environment)
+
+- `CHAT_TOKEN`: require an access key. The first visit uses `/?t=KEY`, which sets a long-lived cookie and redirects. Every other request without the cookie gets 401. Use this whenever the server is reachable beyond the tailnet (e.g. Tailscale Funnel).
+- `CHAT_APP_NAME` + `CHAT_APP_ICON`: make the page installable as a phone app. `CHAT_APP_ICON=name` serves `icon/name-any-512.png` and `icon/name-maskable-512.png` with a `/manifest.json`. Chrome only installs from https, so use Tailscale Serve or Funnel.
+- `CHAT_APPEND_PROMPT`: replace the default "chatting with Mike" system note (e.g. for a copy someone else uses).
