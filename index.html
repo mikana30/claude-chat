@@ -47,6 +47,13 @@
   textarea{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);min-height:44px;max-height:200px}
   #mic.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
   #mic.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  /* Conversation button shows a small Astrid orb (Mike 11/4); the plain mic is dictation only */
+  #mic{padding:6px 9px;display:flex;align-items:center;justify-content:center}
+  .orbIcon{display:block;width:22px;height:22px;border-radius:50%;
+    background:radial-gradient(circle,#fff 0,#e6f9ff 18%,#2fe6ff 42%,rgba(47,230,255,.45) 62%,rgba(47,230,255,0) 72%);
+    box-shadow:0 0 6px 1px rgba(47,230,255,.55)}
+  #mic.on .orbIcon{background:radial-gradient(circle,#fff 0,#efe9ff 18%,#8a5cff 42%,rgba(138,92,255,.45) 62%,rgba(138,92,255,0) 72%);box-shadow:0 0 6px 1px rgba(255,255,255,.6)}
+  #dict.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
   /* Conversation overlay: the orb, a caption and controls; shown only in conversation mode */
   #orbWrap{position:fixed;inset:0;z-index:50;background:#03050a;display:flex;flex-direction:column;align-items:center;color:#dfe8f5}
   #orb{position:absolute;inset:0;width:100%;height:100%;touch-action:manipulation;cursor:pointer}
@@ -92,7 +99,8 @@
 <div id="log"></div>
 <form id="f">
   <textarea id="in" placeholder="Message…" title="Enter to send, Shift+Enter for a new line" rows="1"></textarea>
-  <button id="mic" type="button" title="Start a spoken conversation (Chrome); tap again to end">🎤</button>
+  <button id="dict" type="button" title="Dictate: speak to type into the box (Chrome); tap again to stop" aria-label="Dictate">🎤</button>
+  <button id="mic" type="button" title="Start a spoken conversation (Chrome); tap again to end" aria-label="Spoken conversation"><span class="orbIcon"></span></button>
   <button class="primary" id="send" type="submit">Send</button>
 </form>
 <div id="orbWrap" hidden>
@@ -326,7 +334,24 @@ function startListening(){
   try{recog.start();}catch(e){listening=false;micBtn.classList.remove('listening');recog=null;}
 }
 function stopListening(){if(recog)recog.stop();}
-micBtn.addEventListener('click',()=>convo?endConvo():startConvo());
+micBtn.addEventListener('click',()=>{stopDictation();convo?endConvo():startConvo();});
+
+// ---- Dictation (Mike 11/4): speak to type into the box; nothing is sent or spoken. Tap again to stop. ----
+const dictBtn=document.getElementById('dict');let dict=null;
+if(!SR){dictBtn.disabled=true;dictBtn.title='Speech recognition needs Chrome';}
+function stopDictation(){if(dict){try{dict.stop()}catch(e){}}}
+function startDictation(){
+  if(!SR||dict||convo)return;
+  const base=input.value.replace(/\s+$/,'');
+  dict=new SR();dict.lang='en-US';dict.interimResults=true;dict.continuous=true;
+  dict.onresult=e=>{let t='';for(const r of e.results)t+=r[0].transcript+' ';t=t.replace(/\s+/g,' ').trim();
+    input.value=(base?base+' ':'')+t;input.dispatchEvent(new Event('input'));};
+  dict.onerror=e=>{if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
+  dict.onend=()=>{dict=null;dictBtn.classList.remove('listening');dictBtn.title='Dictate: speak to type into the box (Chrome); tap again to stop';input.focus();};
+  dictBtn.classList.add('listening');dictBtn.title='Stop dictating';
+  try{dict.start();}catch(e){dict=null;dictBtn.classList.remove('listening');}
+}
+dictBtn.addEventListener('click',()=>dict?stopDictation():startDictation());
 document.getElementById('orb').addEventListener('click',endConvo);
 document.getElementById('orbEnd').addEventListener('click',endConvo);
 // "Talk now" interrupts the reply and listens; while listening, "Done" sends what was heard.
