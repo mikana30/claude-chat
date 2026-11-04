@@ -337,6 +337,17 @@ function endConvo(){
 }
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 if(!SR){micBtn.disabled=true;micBtn.title='Speech recognition needs Chrome';}
+// Join recognition results. Some Chrome builds (seen on Mike's phone 11/4) send each result as the whole
+// transcript so far, so plain concatenation repeats the sentence; a result that already contains the
+// text so far replaces it instead of being appended.
+function joinResults(results,from){
+  const norm=x=>x.toLowerCase().replace(/[^a-z0-9' ]/g,'').replace(/\s+/g,' ').trim();
+  let out='';
+  for(let i=from||0;i<results.length;i++){const t=results[i][0].transcript.trim();if(!t)continue;
+    const a=norm(out),b=norm(t);
+    if(!a||b.startsWith(a))out=t;else if(!a.endsWith(b))out+=' '+t;}
+  return out;
+}
 function startListening(){
   if(!SR||listening)return;
   stopAudio();
@@ -344,8 +355,8 @@ function startListening(){
   recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=true;
   let final='',fatal=false,quiet=null;
   const PAUSE_MS=2500;
-  recog.onresult=e=>{let f='',interim='';for(const r of e.results){if(r.isFinal)f+=r[0].transcript+' ';else interim+=r[0].transcript;}
-    final=f;input.value=(final+' '+interim).replace(/\s+/g,' ').trim();orbCap.className='';orbCap.textContent=input.value;
+  recog.onresult=e=>{
+    final=joinResults([...e.results].filter(r=>r.isFinal));input.value=joinResults(e.results).replace(/\s+/g,' ').trim();orbCap.className='';orbCap.textContent=input.value;
     clearTimeout(quiet);quiet=setTimeout(()=>{if(recog)recog.stop();},PAUSE_MS);};
   recog.onerror=e=>{if(e.error==='not-allowed'||e.error==='service-not-allowed'||e.error==='audio-capture')fatal=true;
     if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
@@ -372,7 +383,7 @@ function startDictation(){
   if(!SR||dict||convo)return;
   const base=input.value.replace(/\s+$/,'');
   dict=new SR();dict.lang='en-US';dict.interimResults=true;dict.continuous=true;
-  dict.onresult=e=>{let t='';for(const r of e.results)t+=r[0].transcript+' ';t=t.replace(/\s+/g,' ').trim();
+  dict.onresult=e=>{const t=joinResults(e.results).replace(/\s+/g,' ').trim();
     input.value=(base?base+' ':'')+t;input.dispatchEvent(new Event('input'));};
   dict.onerror=e=>{if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
   dict.onend=()=>{dict=null;dictBtn.classList.remove('listening');dictBtn.title='Dictate: speak to type into the box (Chrome); tap again to stop';input.focus();};
