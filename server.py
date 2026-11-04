@@ -118,6 +118,36 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # jobs share the same project dir, so the CLI's transcript folder alone can't tell them apart).
 # Messages are read back from the CLI's transcript, ~/.claude/projects/<cwd slug>/<id>.jsonl.
 INDEX_PATH = os.path.expanduser(f"~/.local/state/claude-chat/sessions-{PORT}.json")
+# Photos/videos from the camera button (Mike 11/4). Photos are shrunk; videos become ~1 frame/s (no sound).
+UPLOAD_DIR = os.path.expanduser(f"~/.local/state/claude-chat/uploads-{PORT}")
+UPLOAD_MAX = 300 * 1024 * 1024
+VIDEO_MAX_FRAMES = 40
+
+
+def save_upload(data, ctype):
+    """Store an upload and return {"kind", "paths"}: image files Claude can Read."""
+    import secrets
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    stem = os.path.join(UPLOAD_DIR, time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3))
+    raw = stem + ".src"
+    with open(raw, "wb") as f:
+        f.write(data)
+    try:
+        if ctype.startswith("video/"):
+            os.makedirs(stem, exist_ok=True)
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", raw, "-vf",
+                            "fps=1,scale='min(1280,iw)':-2", "-frames:v", str(VIDEO_MAX_FRAMES),
+                            "-q:v", "4", os.path.join(stem, "frame-%03d.jpg")], check=True, timeout=180)
+            paths = sorted(glob.glob(os.path.join(stem, "frame-*.jpg")))
+            if not paths:
+                raise ValueError("no frames in video")
+            return {"kind": "video", "paths": paths}
+        out = stem + ".jpg"
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", raw, "-vf",
+                        "scale='min(1600,iw)':-2", "-frames:v", "1", "-q:v", "3", out], check=True, timeout=60)
+        return {"kind": "photo", "paths": [out]}
+    finally:
+        os.remove(raw)
 TRANSCRIPT_DIR = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", WORKDIR))
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _index_lock = threading.Lock()
@@ -301,10 +331,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return self._deny()
-        if self.path not in ("/chat", "/tts"):
+        if self.path not in ("/chat", "/tts", "/upload"):
             self.send_error(404)
             return
         n = int(self.headers.get("Content-Length", "0"))
+        if self.path == "/upload":
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not (ctype.startswith("image/") or ctype.startswith("video/")) or not 0 < n <= UPLOAD_MAX:
+                self.send_error(400)
+                return
+            try:
+                res = save_upload(self.rfile.read(n), ctype)
+            except Exception as e:
+                log(f"upload error: {e}")
+                self.send_error(422, "Could not read that file")
+                return
+            log(f"upload {res['kind']} {len(res['paths'])} image(s)")
+            return self._send(json.dumps(res).encode(), "application/json")
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except json.JSONDecodeError:

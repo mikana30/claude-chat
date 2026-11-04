@@ -53,6 +53,25 @@
     background:radial-gradient(circle,#fff 0,#e6f9ff 18%,#2fe6ff 42%,rgba(47,230,255,.45) 62%,rgba(47,230,255,0) 72%);
     box-shadow:0 0 6px 1px rgba(47,230,255,.55)}
   #mic.on .orbIcon{background:radial-gradient(circle,#fff 0,#efe9ff 18%,#8a5cff 42%,rgba(138,92,255,.45) 62%,rgba(138,92,255,0) 72%);box-shadow:0 0 6px 1px rgba(255,255,255,.6)}
+  /* Phone layout (Mike 11/4): the message box gets the full width; buttons sit on a row below it */
+  #f{flex-wrap:wrap;align-items:flex-end}
+  #f textarea{flex:1 1 300px}
+  #f .btns{display:flex;gap:8px;align-items:center}
+  #f .btns .grow{flex:1}
+  @media (max-width:600px){#f textarea{flex-basis:100%}#f .btns{flex:1 1 100%}}
+  #f .btns{position:relative}
+  #camMenu{position:absolute;bottom:calc(100% + 6px);left:0;z-index:20;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.25);overflow:hidden}
+  #camMenu[hidden]{display:none!important}
+  #camMenu button{border:0;border-radius:0;text-align:left;padding:12px 18px;white-space:nowrap;border-bottom:1px solid var(--line)}
+  #camMenu button:last-child{border-bottom:0}
+  #att{display:flex;flex-wrap:wrap;gap:6px;width:100%}
+  #att:empty{display:none}
+  #att .chip{position:relative;width:56px;height:56px;border-radius:8px;overflow:hidden;border:1px solid var(--line);background:var(--tool)}
+  #att .chip img,#att .chip video{width:100%;height:100%;object-fit:cover}
+  #att .chip button{position:absolute;top:2px;right:2px;padding:0 5px;font-size:12px;line-height:16px;border-radius:999px;background:rgba(0,0,0,.6);color:#fff;border:0}
+  #att .chip .tag{position:absolute;left:3px;bottom:2px;font-size:10px;color:#fff;text-shadow:0 0 3px #000}
+  .me .thumbs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
+  .me .thumbs img,.me .thumbs video{width:72px;height:72px;object-fit:cover;border-radius:6px}
   #dict.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
   /* Conversation overlay: the orb, a caption and controls; shown only in conversation mode */
   #orbWrap{position:fixed;inset:0;z-index:50;background:#03050a;display:flex;flex-direction:column;align-items:center;color:#dfe8f5}
@@ -98,10 +117,19 @@
 <div id="pastPanel"></div>
 <div id="log"></div>
 <form id="f">
+  <div id="att"></div>
   <textarea id="in" placeholder="Message…" title="Enter to send, Shift+Enter for a new line" rows="1"></textarea>
+  <div class="btns">
+  <button id="cam" type="button" title="Add a photo or video" aria-label="Add a photo or video">📷</button>
+  <input id="camFile" type="file" accept="image/*,video/*" multiple hidden>
+  <input id="camPhoto" type="file" accept="image/*" capture="environment" hidden>
+  <input id="camVideo" type="file" accept="video/*" capture="environment" hidden>
+  <div id="camMenu" hidden><button type="button" data-in="camPhoto">Take a photo</button><button type="button" data-in="camVideo">Record a video</button><button type="button" data-in="camFile">From gallery</button></div>
+  <span class="grow"></span>
   <button id="dict" type="button" title="Dictate: speak to type into the box (Chrome); tap again to stop" aria-label="Dictate">🎤</button>
   <button id="mic" type="button" title="Start a spoken conversation (Chrome); tap again to end" aria-label="Spoken conversation"><span class="orbIcon"></span></button>
   <button class="primary" id="send" type="submit">Send</button>
+  </div>
 </form>
 <div id="orbWrap" hidden>
   <canvas id="orb" title="Tap to end the conversation" aria-label="End conversation" role="button"></canvas>
@@ -488,9 +516,12 @@ const Orb=(function(){
   return {start,stop,setState,setTint};
 })();
 
-async function send(text){
+async function send(text,items){
   stopAudio();replyText='';let spoke=false;
-  add('msg me',text);
+  const meB=add('msg me',items&&items.length?text.replace(/\n\n\[Attached[\s\S]*$/,''):text);
+  if(items&&items.length){const th=document.createElement('div');th.className='thumbs';
+    for(const a of items){const v=a.file.type.startsWith('video/');const m=document.createElement(v?'video':'img');m.src=a.url;if(v){m.muted=true;m.controls=true;m.playsInline=true;}th.append(m);}
+    meB.prepend(th);}
   if(convo){orbSet('thinking');orbCap.className='';orbCap.textContent=text;}
   let ai=newBubble(),buf='',t0=Date.now(),gotDone=false;
   status(ai,'Working…');
@@ -543,7 +574,43 @@ async function send(text){
   }
 }
 
-form.addEventListener('submit',e=>{e.preventDefault();const t=input.value.trim();if(!t||sendBtn.disabled)return;input.value='';input.style.height='auto';send(t);});
+// ---- Camera button (Mike 11/4): photos and videos are uploaded to the server on send;
+// Claude gets the saved image paths (a video arrives as about one frame per second, no sound). ----
+const camBtn=document.getElementById('cam'),camFile=document.getElementById('camFile'),attEl=document.getElementById('att');
+let pending=[];
+// The camera button opens a small menu: take a photo / record a video (opens the phone camera) / from gallery.
+const camMenu=document.getElementById('camMenu');
+camBtn.addEventListener('click',e=>{e.stopPropagation();camMenu.hidden=!camMenu.hidden;});
+document.addEventListener('click',e=>{if(!camMenu.hidden&&!camMenu.contains(e.target))camMenu.hidden=true;});
+camMenu.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;camMenu.hidden=true;document.getElementById(b.dataset.in).click();});
+for(const inp of [camFile,document.getElementById('camPhoto'),document.getElementById('camVideo')])
+  inp.addEventListener('change',()=>{for(const f of inp.files)if(/^(image|video)\//.test(f.type))pending.push({file:f,url:URL.createObjectURL(f)});inp.value='';drawAtt();});
+function drawAtt(){
+  attEl.textContent='';
+  pending.forEach((a,i)=>{const c=document.createElement('div');c.className='chip';
+    const v=a.file.type.startsWith('video/');const m=document.createElement(v?'video':'img');m.src=a.url;if(v){m.muted=true;m.playsInline=true;}
+    const x=document.createElement('button');x.type='button';x.textContent='✕';x.title='Remove';
+    x.onclick=()=>{URL.revokeObjectURL(a.url);pending.splice(i,1);drawAtt();};
+    c.append(m,x);if(v){const t=document.createElement('span');t.className='tag';t.textContent='video';c.append(t);}
+    attEl.append(c);});
+}
+async function uploadPending(){
+  const lines=[];
+  for(const a of pending){
+    const r=await fetch('/upload',{method:'POST',headers:{'Content-Type':a.file.type},body:a.file});
+    if(!r.ok)throw new Error('Upload failed ('+r.status+') for '+(a.file.name||'a file'));
+    const j=await r.json();
+    if(j.kind==='video')lines.push(`[Attached video, ${j.paths.length} frames at about 1 per second, no sound. Read these images in order: ${j.paths.join(' ')}]`);
+    else lines.push(`[Attached photo. Read this image: ${j.paths[0]}]`);
+  }
+  return lines;
+}
+form.addEventListener('submit',async e=>{e.preventDefault();const t=input.value.trim();if((!t&&!pending.length)||sendBtn.disabled)return;
+  if(!pending.length){input.value='';input.style.height='auto';send(t);return;}
+  const items=pending;setBusy(true);const note=add('sys','Uploading '+items.length+(items.length>1?' files…':' file…'));
+  let lines;try{lines=await uploadPending();}catch(err){note.remove();setBusy(false);add('error',err.message);return;}
+  note.remove();setBusy(false);pending=[];drawAtt();input.value='';input.style.height='auto';
+  send((t||'What do you see?')+'\n\n'+lines.join('\n'),items);});
 input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
 input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,200)+'px';});
 stopBtn.addEventListener('click',()=>{if(controller)controller.abort();stopAudio();});
