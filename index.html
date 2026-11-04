@@ -528,6 +528,7 @@ const Orb=(function(){
 })();
 
 async function send(text,items){
+  try{localStorage.setItem('claude-chat-last',String(Date.now()))}catch(e){}
   stopAudio();replyText='';let spoke=false;
   const meB=add('msg me',items&&items.length?text.replace(/\n\n\[Attached[\s\S]*$/,''):text);
   if(items&&items.length){const th=document.createElement('div');th.className='thumbs';
@@ -626,6 +627,10 @@ input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventD
 input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,200)+'px';});
 stopBtn.addEventListener('click',()=>{if(controller)controller.abort();stopAudio();});
 newBtn.addEventListener('click',()=>{closePast();sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
+// A chat idle for more than STALE_H hours starts fresh on open (Mike 11/4); old chats stay under Past.
+const STALE_H=4;
+try{const last=+localStorage.getItem('claude-chat-last')||0;
+  if(sessionId&&Date.now()-last>STALE_H*3600e3){sessionId=null;localStorage.removeItem('claude-chat-session');}}catch(e){}
 if(sessionId) openSession(sessionId);  // after the voice globals above exist
 input.focus();
 </script>
