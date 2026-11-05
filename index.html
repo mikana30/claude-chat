@@ -222,9 +222,10 @@ const orbWrap=document.getElementById('orbWrap'),orbState=document.getElementByI
 const orbTalk=document.getElementById('orbTalk');
 
 // Optional emotion tag at the start of a reply: [happy] [concerned] [urgent] [neutral].
-const EMO_RE=/^\s*\[(happy|concerned|urgent|neutral)\]\s*/i;
+const EMO_RE=/^\s*\[(happy|concerned|urgent|neutral|silent)\]\s*/i;  // Astrid's tags; [silent] = not addressed to her
 const EMO_COL={happy:[255,201,74],concerned:[255,160,46],urgent:[255,59,59],neutral:null};
-function stripEmo(s){if(/^\s*\[[a-z]{0,12}$/i.test(s))return '';return s.replace(EMO_RE,'');}
+const EMO_ANY=/\s*\[(happy|concerned|urgent|neutral|silent)\]\s*/gi;  // Astrid repeats the tag after a tool call
+function stripEmo(s){if(/^\s*\[[a-z]{0,12}$/i.test(s))return '';return s.replace(EMO_ANY,(m,t,i)=>i===0?'':' ').replace(/^\s+/,'');}
 function emoOf(s){const m=EMO_RE.exec(s);return m?m[1].toLowerCase():null;}
 
 function stripMd(s){
@@ -317,6 +318,63 @@ function speak(text,preview){
   if(convo&&!preview){Orb.setTint(emo?EMO_COL[emo]:null,emo==='urgent');orbCap.className='reply';orbCap.textContent=t.length>400?t.slice(0,400)+'…':t;}
   if(voiceName==='browser')speakBrowser(t,preview);else speakWav(t,preview);
   return true;
+}
+
+// ---- Streaming speech (conversation mode), ported from Astrid's brain.py Speech class (Mike 11/4):
+// each sentence is spoken as soon as it arrives instead of after the whole reply, the first tag
+// colours the orb, a tool call with nothing said yet speaks the acknowledgement, and the
+// speakable filter drops what a voice can't say (links, tags, markdown).
+const SENT_END=/[.!?](?=\s)/, ACK='Just a moment.';
+let sq=[],sqBusy=false,spBuf='',spEmo=null,spQueued=0,spCap='',turnOpen=false,spWarned=false;
+function speakable(t){
+  t=t.replace(/\[(\w+)\]/g,'').replace(/https?:\/\/\S+/g,'the link');
+  t=stripMd(t).replace(/[*_`#>|]+/g,'').replace(/^\s*[-•]\s*/gm,'');
+  return t.replace(/\s+/g,' ').trim();
+}
+function spReset(){stopAudio();sq=[];sqBusy=false;spBuf='';spEmo=null;spQueued=0;spCap='';turnOpen=true;spWarned=false;Orb.setTint(null,false);}
+function spText(d){
+  if(!convo||spEmo==='silent')return;
+  spBuf+=d;
+  if(spEmo===null){
+    const lead=spBuf.trimStart();
+    if(lead.startsWith('[')&&!lead.includes(']')&&lead.length<20)return;   // tag still arriving
+    const m=EMO_RE.exec(spBuf);
+    if(m){spEmo=m[1].toLowerCase();spBuf=spBuf.slice(m[0].length);if(spEmo==='silent'){spBuf='';return;}Orb.setTint(EMO_COL[spEmo]||null,spEmo==='urgent');}
+    else spEmo='neutral';
+  }
+  for(;;){const m=SENT_END.exec(spBuf);if(!m)break;spPut(spBuf.slice(0,m.index+1));spBuf=spBuf.slice(m.index+1);}
+}
+function spFlush(){if(spEmo!=='silent'&&spBuf.trim())spPut(spBuf);spBuf='';}
+function spTool(){if(convo&&spEmo!=='silent'&&spQueued===0&&!spBuf.trim())spPut(ACK);}
+function spPut(t){
+  t=speakable(t);if(!t)return;
+  spQueued++;sq.push(t);
+  spCap=(spCap?spCap+' ':'')+t;orbCap.className='reply';orbCap.textContent=spCap.length>400?'…'+spCap.slice(-400):spCap;
+  spPump();
+}
+function ttsFor(t){return voiceName==='browser'?Promise.resolve({text:t}):fetchTts(t).then(b=>({blob:b,text:t}));}
+function speakBrowserP(t){return new Promise(res=>{
+  if(!('speechSynthesis' in window)){res();return;}
+  const u=new SpeechSynthesisUtterance(t);u.rate=1.05;
+  const v=synth.getVoices().find(v=>/en/i.test(v.lang)&&/Google|Natural|Premium/i.test(v.name))||synth.getVoices().find(v=>/en/i.test(v.lang));
+  if(v)u.voice=v;
+  const gen=speakGen;
+  u.onstart=()=>{if(gen!==speakGen)return;synthTalking=true;simT0=performance.now();if(convo)orbSet('speaking');};
+  u.onend=u.onerror=()=>{if(gen===speakGen)synthTalking=false;res();};
+  synth.speak(u);});}
+async function spPump(){
+  if(sqBusy)return;sqBusy=true;const gen=speakGen;
+  let next=sq.length?ttsFor(sq.shift()):null;
+  while(next){
+    const item=await next;if(gen!==speakGen)return;
+    next=sq.length?ttsFor(sq.shift()):null;
+    if(item.blob)await playBlob(item.blob);
+    else{if(voiceName!=='browser'&&!spWarned){spWarned=true;add('error','Voice: server could not synthesize; using the browser voice');}await speakBrowserP(item.text);}
+    if(gen!==speakGen)return;
+    if(!next&&sq.length)next=ttsFor(sq.shift());
+  }
+  sqBusy=false;
+  if(turnOpen){if(convo)orbSet('thinking');}else afterSpeech();
 }
 
 // ---- Conversation mode + overlay ----
@@ -529,7 +587,7 @@ const Orb=(function(){
 
 async function send(text,items){
   try{localStorage.setItem('claude-chat-last',String(Date.now()))}catch(e){}
-  stopAudio();replyText='';let spoke=false;
+  spReset();replyText='';
   const meB=add('msg me',items&&items.length?text.replace(/\n\n\[Attached[\s\S]*$/,''):text);
   if(items&&items.length){const th=document.createElement('div');th.className='thumbs';
     for(const a of items){const v=a.file.type.startsWith('video/');const m=document.createElement(v?'video':'img');m.src=a.url;if(v){m.muted=true;m.controls=true;m.playsInline=true;}th.append(m);}
@@ -541,7 +599,7 @@ async function send(text,items){
   setBusy(true);controller=new AbortController();
   try{
     const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:text,session_id:sessionId,model:modelSel.value,effort:effortSel.value}),signal:controller.signal});
+      body:JSON.stringify({message:text,session_id:sessionId,model:modelSel.value,effort:effortSel.value,voice:convo}),signal:controller.signal});
     if(!r.ok){throw new Error('HTTP '+r.status)}
     const reader=r.body.getReader(),dec=new TextDecoder();let rest='';
     while(true){
@@ -555,10 +613,11 @@ async function send(text,items){
         else if(ev.type==='thinking'){/* thinking stays hidden */}
         else if(ev.type==='text'){
           if(ai.classList.contains('status')){ai.classList.remove('status');ai.textContent='';}
-          buf+=ev.text;replyText+=ev.text;render(ai,stripEmo(buf));scroll();
+          buf+=ev.text;replyText+=ev.text;spText(ev.text);render(ai,stripEmo(buf));scroll();
         }
         else if(ev.type==='tool'){
           // Tool use stays hidden: close any text so far and show one quiet placeholder.
+          spTool();
           if(buf){ai.classList.remove('cursor');ai=newBubble();buf='';status(ai,'Working…');}
         }
         else if(ev.type==='tool_input'){/* hidden */}
@@ -575,14 +634,14 @@ async function send(text,items){
         }
       }
     }
-    if(gotDone) spoke=speak(replyText);
+    if(gotDone) spFlush();
     if(!gotDone) add('error','Connection ended before Claude finished (no result event). Check the server log.');
   }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else add('error',String(e)); }
   finally{
     clearInterval(tick);
     for(const el of log.querySelectorAll('.msg.ai.cursor')){el.classList.remove('cursor');if(el.classList.contains('status')||!el.textContent.trim())el.remove();}
-    setBusy(false);controller=null;input.focus();
-    if(convo&&!spoke)startListening();  // nothing to say (error, stop, empty reply): go back to listening
+    turnOpen=false;setBusy(false);controller=null;input.focus();
+    if(convo&&!sqBusy)startListening();  // nothing left to say (spoken already, error, stop, [silent]): go back to listening
   }
 }
 

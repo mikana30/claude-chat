@@ -27,6 +27,45 @@ APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
     "work, people, or projects, and mcp__openbrain__remember when Mike asks you to "
     "remember something. Keep replies conversational and short unless asked for depth."
 )
+# Conversation mode (Mike 11/4): the chat is Astrid. Her system prompt is loaded from the same
+# file her tablet brain uses, so the two never drift; a spoken message carries SPOKEN_TAG so her
+# "How to speak" rules (emotion tag, no markdown, short) apply only when the reply is read aloud.
+# CHAT_ASTRID_PROMPT=off disables this (a chat that is not Astrid, e.g. Shana's).
+ASTRID_PROMPT_FILE = os.environ.get("CHAT_ASTRID_PROMPT", os.path.expanduser("~/astrid-brain/astrid.md"))
+SPOKEN_TAG = "[spoken to Astrid through the chat app; your reply is read aloud]"
+ASTRID_FRAMING = (
+    "\n\n# Astrid in the chat app\n"
+    "Mike also reaches you through this chat app, typed or spoken. You are Astrid here too; her "
+    "instructions follow. A message that starts with the tag " + SPOKEN_TAG + " came in by voice and "
+    "your whole reply is read aloud: follow the 'How to speak' rules exactly (emotion tag first, no "
+    "markdown, lists, tables, code, paths or URLs, one to three sentences, offer detail instead of "
+    "reading it, and say a short acknowledgement before any tool call). A typed message (no tag) is "
+    "read on screen: answer as normal text chat, no emotion tag, markdown as useful.\n"
+)
+_hostname = os.uname().nodename.split(".")[0]
+
+
+def astrid_prompt_mtime():
+    if not ASTRID_PROMPT_FILE or ASTRID_PROMPT_FILE.lower() == "off":
+        return None
+    try:
+        return os.stat(ASTRID_PROMPT_FILE).st_mtime
+    except OSError:
+        return None
+
+
+def system_prompt():
+    prompt = APPEND_PROMPT
+    if astrid_prompt_mtime() is not None:
+        with open(ASTRID_PROMPT_FILE) as f:
+            prompt += ASTRID_FRAMING + "\n" + f.read()
+        if _hostname != "uriel":
+            prompt += ("\n\nNote: this chat runs on " + _hostname + ", not uriel. Astrid's scripts "
+                       "(~/astrid-brain/remind.py, dnd.py, look.py, session.py) live on uriel; run them "
+                       "over ssh as `ssh mikana@uriel python3 ~/astrid-brain/<script> ...`.\n")
+    return prompt
+
+
 # Optional access key. When set (e.g. a copy exposed through Tailscale Funnel),
 # every request needs the key: the first visit carries it as ?t=KEY, which is
 # stored as a long-lived cookie, then the browser is redirected to a clean URL.
@@ -197,6 +236,8 @@ def session_history(session_id):
                 reply = []  # a hook-forced rewrite replaces the earlier draft of this turn
                 if e.get("isMeta"):
                     continue
+                if c.startswith(SPOKEN_TAG):
+                    c = c[len(SPOKEN_TAG):].lstrip()
                 msgs.append({"role": "user", "text": c})
                 msgs.append({"role": "assistant", "text": ""})
             elif e.get("type") == "assistant" and isinstance(c, list) and msgs:
@@ -244,7 +285,7 @@ def build_cmd(session_id, resume, model=None, effort=None):
         "--effort", effort or EFFORT,
         "--tools", "default",
         "--permission-mode", PERMISSION_MODE,
-        "--append-system-prompt", APPEND_PROMPT,
+        "--append-system-prompt", system_prompt(),
     ]
     cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
     return cmd
@@ -260,6 +301,7 @@ class Session:
         self.events = None
         self.stderr = collections.deque(maxlen=40)
         self.model = self.effort = None
+        self.prompt_mtime = None      # astrid.md as loaded; a change restarts the process (Astrid's rule)
         self.lock = threading.Lock()  # held for the whole turn
         self.last = time.time()
 
@@ -298,11 +340,12 @@ class Session:
         threading.Thread(target=read, daemon=True).start()
         threading.Thread(target=read_err, daemon=True).start()
         self.p, self.events, self.model, self.effort = p, events, model, effort
+        self.prompt_mtime = astrid_prompt_mtime()
         log(f"claude start pid={p.pid} session={self.sid[:8]} resume={self.resume} model={model} effort={effort}")
 
     def ensure(self, model, effort):
         """A running process with these flags. True if one was (re)started."""
-        if self.alive() and (self.model, self.effort) == (model, effort):
+        if self.alive() and (self.model, self.effort, self.prompt_mtime) == (model, effort, astrid_prompt_mtime()):
             return False
         self.stop()
         self.start(model, effort)
@@ -492,6 +535,7 @@ class Handler(BaseHTTPRequestHandler):
         session_id = req.get("session_id") or None
         model = (req.get("model") or "").strip() or None
         effort = (req.get("effort") or "").strip() or None
+        spoken = bool(req.get("voice")) and astrid_prompt_mtime() is not None
         if not message or (effort and effort not in EFFORTS) \
                 or (model and not model.replace("-", "").replace(".", "").isalnum()):
             self.send_error(400)
@@ -516,9 +560,9 @@ class Handler(BaseHTTPRequestHandler):
             started = sess.ensure(model, effort)
             sess.drain()
             log(f"chat start pid={sess.p.pid} session={sess.sid[:8]} new_proc={started} model={model} "
-                f"effort={effort} msg={message[:60]!r}")
+                f"effort={effort} spoken={spoken} msg={message[:60]!r}")
             self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
-            sess.send(message)
+            sess.send((SPOKEN_TAG + " " + message) if spoken else message)
             deadline = t0 + TURN_TIMEOUT_S
             interrupted = False
             while True:
