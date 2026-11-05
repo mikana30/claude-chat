@@ -342,10 +342,12 @@ function spText(d){
     if(m){spEmo=m[1].toLowerCase();spBuf=spBuf.slice(m[0].length);if(spEmo==='silent'){spBuf='';return;}Orb.setTint(EMO_COL[spEmo]||null,spEmo==='urgent');}
     else spEmo='neutral';
   }
+  if(!spQueued&&/^\s*\[silent\]/i.test(spBuf)){spEmo='silent';spBuf='';return;}   // "[neutral] [silent]"
   for(;;){const m=SENT_END.exec(spBuf);if(!m)break;spPut(spBuf.slice(0,m.index+1));spBuf=spBuf.slice(m.index+1);}
 }
 function spFlush(){if(spEmo!=='silent'&&spBuf.trim())spPut(spBuf);spBuf='';}
-function spTool(){if(convo&&spEmo!=='silent'&&spQueued===0&&!spBuf.trim())spPut(ACK);}
+// Same order as the tablet (brain.py): flush what was said, then the acknowledgement only if nothing was.
+function spTool(){if(!convo||spEmo==='silent')return;spFlush();if(spQueued===0)spPut(ACK);}
 function spPut(t){
   t=speakable(t);if(!t)return;
   spQueued++;sq.push(t);
@@ -620,6 +622,7 @@ async function send(text,items){
           spTool();
           if(buf){ai.classList.remove('cursor');ai=newBubble();buf='';status(ai,'Working…');}
         }
+        else if(ev.type==='block_end'){spFlush();}   // tablet flushes at every content_block_stop
         else if(ev.type==='tool_input'){/* hidden */}
         else if(ev.type==='tool_result'){
           // hidden; keep the pending bubble at the bottom

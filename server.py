@@ -657,6 +657,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse({"type": "tool", "name": cb.get("name", "?")})
                 elif cb["type"] == "thinking":
                     self._sse({"type": "thinking"})
+            elif et == "content_block_stop":
+                self._sse({"type": "block_end"})   # page flushes speech here, as the tablet does
             elif et == "content_block_delta":
                 d = e["delta"]
                 if d["type"] == "text_delta":
