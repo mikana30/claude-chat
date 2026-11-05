@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Local web chat UI backed by the Claude Code CLI (Pro plan login).
 
-Runs `claude -p` with the user's full config: all built-in tools, every MCP
+Runs one long-lived `claude -p --input-format stream-json` per chat session, with the user's full config: all built-in tools, every MCP
 server in the user config (OpenBrain included), CLAUDE.md auto-discovery.
 Streams text deltas and tool activity to the browser as server-sent events.
 """
-import glob, hmac, io, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.request, wave
+import collections, glob, hmac, io, json, os, queue, re, subprocess, sys, threading, time, urllib.error, urllib.request, uuid, wave
 from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -221,22 +221,150 @@ def catalog_models():
         return []
 
 
-def build_cmd(message, session_id, model=None, effort=None):
+# ---- Claude processes: one long-lived `claude -p --input-format stream-json` per chat session,
+# ported from Astrid's brain.py (uriel, Mike 11/3). Each turn is one user message on stdin and
+# ends at its "result" event, so the 2-4 s CLI startup is paid once per session, not per message.
+# A process is restarted with --resume (nothing forgotten) when it dies, hangs past TURN_TIMEOUT_S,
+# or the page asks for a different model/effort (those are process flags). Idle processes are
+# reaped after PROC_IDLE_S so they are not holding memory; the next turn resumes the session.
+PROC_IDLE_S = int(os.environ.get("CHAT_PROC_IDLE_S", "1800"))
+PROC_MAX = int(os.environ.get("CHAT_PROC_MAX", "2"))
+TURN_TIMEOUT_S = int(os.environ.get("CHAT_TURN_TIMEOUT_S", "900"))
+EOF = object()
+
+
+def build_cmd(session_id, resume, model=None, effort=None):
     cmd = [
         "claude", "-p",
-        "--model", model or MODEL,
-        "--effort", effort or EFFORT,
+        "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--model", model or MODEL,
+        "--effort", effort or EFFORT,
         "--tools", "default",
         "--permission-mode", PERMISSION_MODE,
         "--append-system-prompt", APPEND_PROMPT,
     ]
-    if session_id:
-        cmd += ["--resume", session_id]
-    cmd.append(message)
+    cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
     return cmd
+
+
+class Session:
+    """One chat session and the Claude process serving it (at most one turn at a time)."""
+
+    def __init__(self, sid, resume):
+        self.sid = sid
+        self.resume = resume          # False only until the first turn has created the transcript
+        self.p = None
+        self.events = None
+        self.stderr = collections.deque(maxlen=40)
+        self.model = self.effort = None
+        self.lock = threading.Lock()  # held for the whole turn
+        self.last = time.time()
+
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+    def stop(self):
+        p, self.p = self.p, None
+        if p and p.poll() is None:
+            try:
+                p.stdin.close()
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+
+    def start(self, model, effort):
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)  # allow spawning from inside a Claude session
+        p = subprocess.Popen(build_cmd(self.sid, self.resume, model, effort), cwd=WORKDIR, env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, bufsize=1)
+        events = queue.Queue()
+
+        def read():
+            for line in p.stdout:
+                try:
+                    events.put(json.loads(line))
+                except ValueError:
+                    log(f"non-json stdout: {line[:200]}")
+            events.put(EOF)
+
+        def read_err():
+            for line in p.stderr:
+                self.stderr.append(line.rstrip())
+
+        threading.Thread(target=read, daemon=True).start()
+        threading.Thread(target=read_err, daemon=True).start()
+        self.p, self.events, self.model, self.effort = p, events, model, effort
+        log(f"claude start pid={p.pid} session={self.sid[:8]} resume={self.resume} model={model} effort={effort}")
+
+    def ensure(self, model, effort):
+        """A running process with these flags. True if one was (re)started."""
+        if self.alive() and (self.model, self.effort) == (model, effort):
+            return False
+        self.stop()
+        self.start(model, effort)
+        return True
+
+    def send(self, text):
+        self._write({"type": "user", "message": {"role": "user", "content": text}})
+
+    def interrupt(self):
+        """Stop the current turn (the CLI answers with a result event); the process lives on."""
+        self._write({"type": "control_request", "request_id": f"i{int(time.time()*1000)}",
+                     "request": {"subtype": "interrupt"}})
+
+    def _write(self, obj):
+        try:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass  # dead process: shows up as EOF on the queue
+
+    def drain(self):
+        while True:
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                return
+
+
+_sessions = {}                 # sid -> Session
+_sessions_lock = threading.Lock()
+
+
+def get_session(sid):
+    with _sessions_lock:
+        s = _sessions.get(sid) if sid else None
+        if s is None:
+            s = Session(sid, resume=True) if sid else Session(str(uuid.uuid4()), resume=False)
+            _sessions[s.sid] = s
+        s.last = time.time()
+        idle = [o for o in _sessions.values() if o is not s and o.alive() and not o.lock.locked()]
+        idle.sort(key=lambda o: o.last)
+        while len(idle) + 1 > PROC_MAX and idle:      # LRU: keep memory flat on the Go
+            o = idle.pop(0)
+            log(f"claude stop (over {PROC_MAX} live) session={o.sid[:8]}")
+            o.stop()
+        return s
+
+
+def reaper():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _sessions_lock:
+            for s in list(_sessions.values()):
+                if s.alive() and now - s.last > PROC_IDLE_S and s.lock.acquire(blocking=False):
+                    try:
+                        log(f"claude stop (idle {int(now - s.last)}s) session={s.sid[:8]}")
+                        s.stop()
+                    finally:
+                        s.lock.release()
+                if not s.alive() and now - s.last > 24 * 3600:
+                    del _sessions[s.sid]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -324,10 +452,6 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def _sse(self, obj):
-        self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
-        self.wfile.flush()
-
     def do_POST(self):
         if not self._authed():
             return self._deny()
@@ -379,43 +503,67 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-        env = dict(os.environ)
-        env.pop("CLAUDECODE", None)  # allow spawning from inside a Claude session
+        sess = get_session(session_id)
+        model, effort = model or MODEL, effort or EFFORT
+        if not sess.lock.acquire(timeout=5):   # a stopped turn ends within a second
+            self._sse({"type": "error", "text": "That chat is still answering the previous message."})
+            return
         t0 = time.time()
-        proc = subprocess.Popen(build_cmd(message, session_id, model, effort), cwd=WORKDIR, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        log(f"chat start pid={proc.pid} session={session_id} model={model or MODEL} "
-            f"effort={effort or EFFORT} msg={message[:60]!r}")
-        self._sse({"type": "started"})
         self.n_events = 0
         self.got_result = False
         self.message = message
         try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
+            started = sess.ensure(model, effort)
+            sess.drain()
+            log(f"chat start pid={sess.p.pid} session={sess.sid[:8]} new_proc={started} model={model} "
+                f"effort={effort} msg={message[:60]!r}")
+            self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
+            sess.send(message)
+            deadline = t0 + TURN_TIMEOUT_S
+            interrupted = False
+            while True:
                 try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    log(f"non-json stdout: {line[:200]}")
-                    continue
+                    ev = sess.events.get(timeout=max(0.1, deadline - time.time()))
+                except queue.Empty:
+                    log(f"chat timeout session={sess.sid[:8]} after {TURN_TIMEOUT_S}s; stopping process")
+                    sess.stop()                 # next turn restarts it with --resume
+                    self._sse({"type": "error", "text": f"claude timed out after {TURN_TIMEOUT_S} s"})
+                    break
+                if ev is EOF:
+                    err = "\n".join(sess.stderr).strip()
+                    rc = sess.p.poll() if sess.p else None
+                    log(f"claude exited pid={sess.p and sess.p.pid} rc={rc} session={sess.sid[:8]} stderr={err[-300:]!r}")
+                    sess.stop()
+                    if not self.got_result:
+                        self._sse({"type": "error", "text": err[-800:] or f"claude exited {rc} without a result"})
+                    break
                 self.n_events += 1
                 self._handle(ev)
-            proc.wait()
-            err = proc.stderr.read().strip()
-            log(f"chat end pid={proc.pid} rc={proc.returncode} events={self.n_events} "
-                f"result={self.got_result} {time.time()-t0:.1f}s"
-                + (f" stderr={err[-300:]!r}" if err else ""))
-            if proc.returncode != 0 or not self.got_result:
-                self._sse({"type": "error",
-                           "text": err[-800:] or f"claude exited {proc.returncode} without a result"})
-        except (BrokenPipeError, ConnectionResetError):
-            log(f"client disconnected pid={proc.pid}; killing")
-            proc.kill()  # client hit Stop or navigated away
+                if ev.get("type") == "result":
+                    break
+                if self.client_gone and not interrupted:   # Stop button: end the turn, keep the process
+                    sess.interrupt()
+                    interrupted = True
+            sess.resume = True
+            sess.last = time.time()
+            log(f"chat end session={sess.sid[:8]} events={self.n_events} result={self.got_result} "
+                f"{time.time()-t0:.1f}s" + (" (client gone)" if self.client_gone else ""))
         finally:
-            if proc.poll() is None:
-                proc.kill()
+            sess.lock.release()
+
+    client_gone = False
+
+    def _sse(self, obj):
+        # The client hitting Stop or navigating away never kills the Claude process (Astrid's
+        # rule): the turn is interrupted and the session stays ready for the next message.
+        if self.client_gone:
+            return
+        try:
+            self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
+            log("client disconnected; interrupting the turn, process kept")
 
     def _handle(self, ev):
         t = ev.get("type")
@@ -469,6 +617,7 @@ if __name__ == "__main__":
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
     threading.Thread(target=preload_voice, daemon=True).start()
+    threading.Thread(target=reaper, daemon=True).start()
     print(f"claude-chat: http://{HOST}:{PORT}  model={MODEL} effort={EFFORT} "
           f"cwd={WORKDIR} perms={PERMISSION_MODE} key={'on' if TOKEN else 'off'} voices={list_voices()}", flush=True)
     try:

@@ -1,9 +1,11 @@
 # claude-chat
 
 A small local web chat UI for Claude that runs on a **Claude Pro plan** (no API key).
-It shells out to the Claude Code CLI (`claude -p`) with your normal user config, so the
-chat has everything the terminal has: all built-in tools, every configured MCP server
-(OpenBrain included), CLAUDE.md, and session resume for multi-turn memory.
+It runs the Claude Code CLI (`claude -p --input-format stream-json`) with your normal user
+config, so the chat has everything the terminal has: all built-in tools, every configured MCP
+server (OpenBrain included), CLAUDE.md, and session resume for multi-turn memory. One CLI
+process stays up per chat session and takes each message on stdin, so the 2-4 s CLI startup
+is paid once per chat instead of once per message (idle processes are stopped after 30 min).
 
 - Model: `claude-opus-5-5` at `low` effort (set in the systemd unit or env)
 - Streams replies token by token; shows each tool call and its result inline
