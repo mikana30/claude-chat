@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CHAT_PORT", "8090"))
 MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5-5")
-EFFORT = os.environ.get("CHAT_EFFORT", "low")
+EFFORT = os.environ.get("CHAT_EFFORT", "medium")
 WORKDIR = os.environ.get("CHAT_CWD", os.path.expanduser("~"))
 PERMISSION_MODE = os.environ.get("CHAT_PERMISSION_MODE", "bypassPermissions")
 # Whose chat this is (Mike 11/4: "so long as we are still aware of whose chat is whose"). Each
