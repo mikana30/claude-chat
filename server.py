@@ -21,10 +21,14 @@ MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("CHAT_EFFORT", "low")
 WORKDIR = os.environ.get("CHAT_CWD", os.path.expanduser("~"))
 PERMISSION_MODE = os.environ.get("CHAT_PERMISSION_MODE", "bypassPermissions")
+# Whose chat this is (Mike 11/4: "so long as we are still aware of whose chat is whose"). Each
+# instance names its owner; the prompt, the Astrid framing and the spoken tag all use it.
+CHAT_USER = os.environ.get("CHAT_USER", "Mike")
 APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
-    "You are chatting with Mike through a web chat UI, not a terminal. "
+    f"You are chatting with {CHAT_USER} through a web chat UI, not a terminal. The person "
+    f"typing or speaking here is {CHAT_USER}. "
     "Use OpenBrain (mcp__openbrain__recall) before answering questions about prior "
-    "work, people, or projects, and mcp__openbrain__remember when Mike asks you to "
+    f"work, people, or projects, and mcp__openbrain__remember when {CHAT_USER} asks you to "
     "remember something. Keep replies conversational and short unless asked for depth."
 )
 # Conversation mode (Mike 11/4): the chat is Astrid. Her system prompt is loaded from the same
@@ -32,11 +36,13 @@ APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
 # "How to speak" rules (emotion tag, no markdown, short) apply only when the reply is read aloud.
 # CHAT_ASTRID_PROMPT=off disables this (a chat that is not Astrid, e.g. Shana's).
 ASTRID_PROMPT_FILE = os.environ.get("CHAT_ASTRID_PROMPT", os.path.expanduser("~/astrid-brain/astrid.md"))
-SPOKEN_TAG = "[spoken to Astrid through the chat app; your reply is read aloud]"
+SPOKEN_TAG = f"[spoken by {CHAT_USER} to Astrid through the chat app; your reply is read aloud]"
 ASTRID_FRAMING = (
     "\n\n# Astrid in the chat app\n"
-    "Mike also reaches you through this chat app, typed or spoken. You are Astrid here too; her "
-    "instructions follow. A message that starts with the tag " + SPOKEN_TAG + " came in by voice and "
+    f"This is {CHAT_USER}'s chat app: the person typing or speaking here is {CHAT_USER}"
+    + ("" if CHAT_USER == "Mike" else ", not Mike") + ". You are Astrid here too; her "
+    "instructions follow (where they say Mike, read the general behaviour; the person here is "
+    f"{CHAT_USER}). A message that starts with the tag " + SPOKEN_TAG + " came in by voice and "
     "your whole reply is read aloud: follow the 'How to speak' rules exactly (emotion tag first, no "
     "markdown, lists, tables, code, paths or URLs, one to three sentences, offer detail instead of "
     "reading it, and say a short acknowledgement before any tool call). A typed message (no tag) is "
@@ -236,8 +242,7 @@ def session_history(session_id):
                 reply = []  # a hook-forced rewrite replaces the earlier draft of this turn
                 if e.get("isMeta"):
                     continue
-                if c.startswith(SPOKEN_TAG):
-                    c = c[len(SPOKEN_TAG):].lstrip()
+                c = re.sub(r"^\[spoken[^\]]*read aloud\]\s*", "", c)   # hide the voice tag, any owner
                 msgs.append({"role": "user", "text": c})
                 msgs.append({"role": "assistant", "text": ""})
             elif e.get("type") == "assistant" and isinstance(c, list) and msgs:
