@@ -24,6 +24,9 @@ PERMISSION_MODE = os.environ.get("CHAT_PERMISSION_MODE", "bypassPermissions")
 # Whose chat this is (Mike 11/4: "so long as we are still aware of whose chat is whose"). Each
 # instance names its owner; the prompt, the Astrid framing and the spoken tag all use it.
 CHAT_USER = os.environ.get("CHAT_USER", "Mike")
+# Where this instance runs / is used from (Mike 11/4: Astrid must know she is not on the office
+# tablet here). Each unit sets it; the browser's user agent adds phone vs computer per message.
+CHAT_DEVICE = os.environ.get("CHAT_DEVICE") or f"a computer ({os.uname().nodename.split('.')[0]})"
 APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
     f"You are chatting with {CHAT_USER} through a web chat UI, not a terminal. The person "
     f"typing or speaking here is {CHAT_USER}. "
@@ -36,17 +39,44 @@ APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
 # "How to speak" rules (emotion tag, no markdown, short) apply only when the reply is read aloud.
 # CHAT_ASTRID_PROMPT=off disables this (a chat that is not Astrid, e.g. Shana's).
 ASTRID_PROMPT_FILE = os.environ.get("CHAT_ASTRID_PROMPT", os.path.expanduser("~/astrid-brain/astrid.md"))
-SPOKEN_TAG = f"[spoken by {CHAT_USER} to Astrid through the chat app; your reply is read aloud]"
+TAG_RE = re.compile(r"^\[(spoken|typed) by [^\]]*\]\s*")   # the per-message tag, hidden in history
+
+
+def device_from_ua(ua):
+    ua = ua or ""
+    if "iPhone" in ua or "iPad" in ua:
+        return "an iPhone or iPad"
+    if "Android" in ua:
+        return "a phone" if "Mobile" in ua else "an Android tablet"
+    return "a computer"
+
+
+def message_tag(spoken, device):
+    how = "spoken" if spoken else "typed"
+    tail = "; your reply is read aloud" if spoken else "; read on screen"
+    return f"[{how} by {CHAT_USER} on {device} through the chat app{tail}]"
+
+
 ASTRID_FRAMING = (
     "\n\n# Astrid in the chat app\n"
-    f"This is {CHAT_USER}'s chat app: the person typing or speaking here is {CHAT_USER}"
-    + ("" if CHAT_USER == "Mike" else ", not Mike") + ". You are Astrid here too; her "
-    "instructions follow (where they say Mike, read the general behaviour; the person here is "
-    f"{CHAT_USER}). A message that starts with the tag " + SPOKEN_TAG + " came in by voice and "
-    "your whole reply is read aloud: follow the 'How to speak' rules exactly (emotion tag first, no "
-    "markdown, lists, tables, code, paths or URLs, one to three sentences, offer detail instead of "
-    "reading it, and say a short acknowledgement before any tool call). A typed message (no tag) is "
-    "read on screen: answer as normal text chat, no emotion tag, markdown as useful.\n"
+    f"This is {CHAT_USER}'s chat app, not the office tablet. It runs on {CHAT_DEVICE}. The person "
+    f"typing or speaking here is {CHAT_USER}" + ("" if CHAT_USER == "Mike" else ", not Mike") + ". "
+    "You are Astrid here too; her instructions follow, but the parts about the tablet do not apply "
+    "in this chat: you are not on the tablet, you cannot hear the office or look through the office "
+    "webcam from here, and you never say you live on the tablet. Your ears here are this device's "
+    f"microphone while {CHAT_USER} is in a spoken conversation (the orb); your eyes are the photos or "
+    f"videos {CHAT_USER} sends with the camera button (they arrive as image paths for you to Read). If "
+    "asked to look, ask for a photo instead. Reminders, Do Not Disturb and session control still work "
+    "(their scripts run on uriel) but a reminder is spoken on the office tablet, so say so when you set "
+    "one. Where Astrid's instructions say Mike, read the general behaviour; the person here is "
+    f"{CHAT_USER}.\n"
+    "Every message starts with a tag saying how it arrived. "
+    f"'{message_tag(False, 'a phone')}' (or 'a computer') was typed and is read on screen: answer as "
+    "normal text chat, no emotion tag, markdown as useful. "
+    f"'{message_tag(True, 'a phone')}' came in by voice and your whole reply is read aloud: follow "
+    "the 'How to speak' rules exactly (emotion tag first, no markdown, lists, tables, code, paths or "
+    "URLs, one to three sentences, offer detail instead of reading it, and say a short acknowledgement "
+    "before any tool call).\n"
 )
 _hostname = os.uname().nodename.split(".")[0]
 
@@ -242,7 +272,7 @@ def session_history(session_id):
                 reply = []  # a hook-forced rewrite replaces the earlier draft of this turn
                 if e.get("isMeta"):
                     continue
-                c = re.sub(r"^\[spoken[^\]]*read aloud\]\s*", "", c)   # hide the voice tag, any owner
+                c = TAG_RE.sub("", c)
                 msgs.append({"role": "user", "text": c})
                 msgs.append({"role": "assistant", "text": ""})
             elif e.get("type") == "assistant" and isinstance(c, list) and msgs:
@@ -540,7 +570,9 @@ class Handler(BaseHTTPRequestHandler):
         session_id = req.get("session_id") or None
         model = (req.get("model") or "").strip() or None
         effort = (req.get("effort") or "").strip() or None
-        spoken = bool(req.get("voice")) and astrid_prompt_mtime() is not None
+        astrid = astrid_prompt_mtime() is not None
+        spoken = bool(req.get("voice")) and astrid
+        tag = message_tag(spoken, device_from_ua(self.headers.get("User-Agent"))) + " " if astrid else ""
         if not message or (effort and effort not in EFFORTS) \
                 or (model and not model.replace("-", "").replace(".", "").isalnum()):
             self.send_error(400)
@@ -565,9 +597,9 @@ class Handler(BaseHTTPRequestHandler):
             started = sess.ensure(model, effort)
             sess.drain()
             log(f"chat start pid={sess.p.pid} session={sess.sid[:8]} new_proc={started} model={model} "
-                f"effort={effort} spoken={spoken} msg={message[:60]!r}")
+                f"effort={effort} tag={tag.strip()[:40]!r} msg={message[:60]!r}")
             self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
-            sess.send((SPOKEN_TAG + " " + message) if spoken else message)
+            sess.send(tag + message)
             deadline = t0 + TURN_TIMEOUT_S
             interrupted = False
             while True:
