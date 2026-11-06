@@ -541,7 +541,9 @@ class Handler(BaseHTTPRequestHandler):
             if not UUID_RE.match(sid):
                 return self.send_error(400)
             try:
-                self._send(json.dumps({"messages": session_history(sid)}).encode(), "application/json")
+                s = _sessions.get(sid)
+                self._send(json.dumps({"messages": session_history(sid),
+                                       "busy": bool(s and s.lock.locked())}).encode(), "application/json")
             except OSError:
                 self.send_error(404)
         elif self.path == "/voices":
@@ -555,6 +557,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return self._deny()
+        if self.path == "/stop":
+            try:
+                sid = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}").get("session_id")
+            except ValueError:
+                sid = None
+            s = _sessions.get(sid) if sid else None
+            if s and s.lock.locked():
+                s.interrupt()
+                log(f"stop requested session={s.sid[:8]}")
+            self._send(b'{"ok":true}', "application/json")
+            return
         if self.path not in ("/chat", "/tts", "/upload", "/transcribe"):
             self.send_error(404)
             return
@@ -619,9 +632,11 @@ class Handler(BaseHTTPRequestHandler):
 
         sess = get_session(session_id)
         model, effort = model or MODEL, effort or EFFORT
-        if not sess.lock.acquire(timeout=5):   # a stopped turn ends within a second
-            self._sse({"type": "error", "text": "That chat is still answering the previous message."})
-            return
+        waited = time.time()
+        while not sess.lock.acquire(timeout=5):   # previous turn still running (maybe in the background)
+            self._sse({"type": "status", "text": "Finishing the previous message first…"})
+            if self.client_gone or time.time() - waited > TURN_TIMEOUT_S:
+                return
         t0 = time.time()
         self.n_events = 0
         self.got_result = False
@@ -634,7 +649,6 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
             sess.send(tag + message)
             deadline = t0 + TURN_TIMEOUT_S
-            interrupted = False
             while True:
                 try:
                     ev = sess.events.get(timeout=max(0.1, deadline - time.time()))
@@ -655,9 +669,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle(ev)
                 if ev.get("type") == "result":
                     break
-                if self.client_gone and not interrupted:   # Stop button: end the turn, keep the process
-                    sess.interrupt()
-                    interrupted = True
+                # A dropped connection (phone screen off, voice conversation over, page reloaded) does
+                # NOT stop the work (Mike 2026-11-06: long jobs died when the voice agent timed out).
+                # Only an explicit POST /stop interrupts; the page reloads /history to show the result.
             sess.resume = True
             sess.last = time.time()
             log(f"chat end session={sess.sid[:8]} events={self.n_events} result={self.got_result} "
@@ -668,8 +682,8 @@ class Handler(BaseHTTPRequestHandler):
     client_gone = False
 
     def _sse(self, obj):
-        # The client hitting Stop or navigating away never kills the Claude process (Astrid's
-        # rule): the turn is interrupted and the session stays ready for the next message.
+        # Navigating away or losing the connection never stops the turn; the Stop button
+        # (POST /stop) interrupts it and keeps the process ready for the next message.
         if self.client_gone:
             return
         try:
@@ -677,7 +691,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             self.client_gone = True
-            log("client disconnected; interrupting the turn, process kept")
+            log("client disconnected; the turn keeps running")
 
     def _handle(self, ev):
         t = ev.get("type")

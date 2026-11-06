@@ -189,15 +189,33 @@ pastBtn.addEventListener('click',async()=>{
     }
   }catch(e){pastPanel.innerHTML='<div class="empty">Could not load past chats.</div>';}
 });
+// The connection can drop mid-turn (phone screen off, network change) while uriel keeps working.
+// Show that, then reload the chat from /history once the turn has finished (Mike 2026-11-06).
+let lostWait=null;
+function lostTurn(){
+  add('sys','Connection dropped. Still working on uriel; the reply will show here when it is done.');
+  watchBusy();
+}
+function watchBusy(){
+  if(lostWait||!sessionId)return;
+  const id=sessionId;
+  lostWait=setInterval(async()=>{
+    if(document.hidden||sendBtn.disabled)return;
+    try{const r=await fetch('/history?id='+encodeURIComponent(id));if(!r.ok)return;const j=await r.json();
+      if(j.busy)return;
+      clearInterval(lostWait);lostWait=null;if(sessionId===id)openSession(id);}catch(e){}
+  },4000);
+}
 async function openSession(id){
   if(sendBtn.disabled)return;
   stopAudio();sessionId=id;try{localStorage.setItem('claude-chat-session',id)}catch(e){}
   log.innerHTML='';
   try{
     const r=await fetch('/history?id='+encodeURIComponent(id));if(!r.ok)throw new Error('HTTP '+r.status);
-    const {messages}=await r.json();
+    const {messages,busy:j_busy}=await r.json();
     for(const m of messages){if(m.role==='user')add('msg me',m.text);else{const d=document.createElement('div');d.className='msg ai';render(d,stripEmo(m.text));log.appendChild(d);}}
-    add('sys','Picked up this chat. Keep typing to continue it.');
+    add('sys',j_busy?'Still working on your last message; it will show here when done.':'Picked up this chat. Keep typing to continue it.');
+    if(j_busy)watchBusy();
   }catch(e){add('sys','Resumed this chat (earlier messages could not be shown).');}
   scroll();input.focus();
 }
@@ -696,6 +714,7 @@ async function send(text,items){
         if(!p.startsWith('data: '))continue;
         const ev=JSON.parse(p.slice(6));
         if(ev.type==='started'){status(ai,'Working…');}
+        else if(ev.type==='status'){status(ai,ev.text);}
         else if(ev.type==='thinking'){/* thinking stays hidden */}
         else if(ev.type==='text'){
           if(ai.classList.contains('status')){ai.classList.remove('status');ai.textContent='';}
@@ -722,8 +741,8 @@ async function send(text,items){
       }
     }
     if(gotDone) spFlush();
-    if(!gotDone) add('error','Connection ended before Claude finished (no result event). Check the server log.');
-  }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else add('error',String(e)); }
+    if(!gotDone) lostTurn();
+  }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else lostTurn(); }
   finally{
     clearInterval(tick);
     for(const el of log.querySelectorAll('.msg.ai.cursor')){el.classList.remove('cursor');if(el.classList.contains('status')||!el.textContent.trim())el.remove();}
@@ -771,7 +790,9 @@ form.addEventListener('submit',async e=>{e.preventDefault();const t=input.value.
   send((t||'What do you see?')+'\n\n'+lines.join('\n'),items);});
 input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
 input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,200)+'px';});
-stopBtn.addEventListener('click',()=>{if(controller)controller.abort();stopAudio();});
+stopBtn.addEventListener('click',()=>{  // only Stop ends a turn; a dropped connection does not
+  if(sessionId)fetch('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId})}).catch(()=>{});
+  if(controller)controller.abort();stopAudio();});
 newBtn.addEventListener('click',()=>{closePast();sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
 // A chat idle for more than STALE_H hours starts fresh on open (Mike 11/4); old chats stay under Past.
 const STALE_H=4;
