@@ -149,6 +149,28 @@ def astrid_wav(text):
     return body
 
 
+# Speech to text: the page records 16 kHz mono PCM and /transcribe passes it to tk-whisper on uriel
+# (the Surface Go keyboard's Whisper service). The phone's own recognizer is not used (Mike 11/5).
+WHISPER_URL = os.environ.get("CHAT_WHISPER_URL", "http://100.116.82.95:8791")
+WHISPER_MAX = 16000 * 2 * 120   # tk-whisper's own cap: 2 minutes
+
+
+def whisper_text(pcm):
+    req = urllib.request.Request(f"{WHISPER_URL}/transcribe", data=pcm, method="POST",
+                                 headers={"Content-Type": "application/octet-stream"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            j = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"whisper HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"whisper unreachable: {getattr(e, 'reason', e)}") from None
+    text = (j.get("text") or "").strip()
+    log(f"stt {len(pcm) / 32000:.1f}s audio {time.time()-t0:.2f}s {len(text)} chars")
+    return text
+
+
 def list_voices():
     piper = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(VOICE_DIR, "*.onnx")))
     return ([ASTRID] if astrid_token() else []) + piper
@@ -533,10 +555,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return self._deny()
-        if self.path not in ("/chat", "/tts", "/upload"):
+        if self.path not in ("/chat", "/tts", "/upload", "/transcribe"):
             self.send_error(404)
             return
         n = int(self.headers.get("Content-Length", "0"))
+        if self.path == "/transcribe":
+            if not 0 < n <= WHISPER_MAX:
+                self.send_error(400)
+                return
+            try:
+                text = whisper_text(self.rfile.read(n))
+            except Exception as e:
+                log(f"stt error: {e}")
+                self.send_error(502, str(e)[:200])
+                return
+            return self._send(json.dumps({"text": text}).encode(), "application/json")
         if self.path == "/upload":
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if not (ctype.startswith("image/") or ctype.startswith("video/")) or not 0 < n <= UPLOAD_MAX:

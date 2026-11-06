@@ -126,8 +126,8 @@
   <input id="camVideo" type="file" accept="video/*" capture="environment" hidden>
   <div id="camMenu" hidden><button type="button" data-in="camPhoto">Take a photo</button><button type="button" data-in="camVideo">Record a video</button><button type="button" data-in="camFile">From gallery</button></div>
   <span class="grow"></span>
-  <button id="dict" type="button" title="Dictate: speak to type into the box (Chrome); tap again to stop" aria-label="Dictate">🎤</button>
-  <button id="mic" type="button" title="Start a spoken conversation (Chrome); tap again to end" aria-label="Spoken conversation"><span class="orbIcon"></span></button>
+  <button id="dict" type="button" title="Dictate: speak to type into the box; tap again to stop" aria-label="Dictate">🎤</button>
+  <button id="mic" type="button" title="Start a spoken conversation; tap again to end" aria-label="Spoken conversation"><span class="orbIcon"></span></button>
   <button class="primary" id="send" type="submit">Send</button>
   </div>
 </form>
@@ -213,11 +213,11 @@ function setBusy(b){sendBtn.disabled=b;stopBtn.hidden=!b;input.disabled=b;}
 function status(el,text){el.classList.add('status');el.textContent=text;scroll();}
 function newBubble(){const d=document.createElement('div');d.className='msg ai cursor';log.appendChild(d);return d;}
 
-// ---- Voice: conversation mode. The mic starts it: listen (Chrome SpeechRecognition), auto-send,
+// ---- Voice: conversation mode. The mic starts it: listen (recorded in the page, words from uriel's Whisper), auto-send,
 // speak the reply (/tts WAV or browser speechSynthesis), listen again. Tap mic/orb/End to stop. ----
 const micBtn=document.getElementById('mic');
 const synth=window.speechSynthesis||{cancel(){},speak(){},getVoices(){return[]}};
-let convo=false,recog=null,listening=false,replyText='',speakGen=0,curAudio=null,idleRounds=0,synthTalking=false;
+let convo=false,listening=false,replyText='',speakGen=0,curAudio=null,idleRounds=0,synthTalking=false;
 const orbWrap=document.getElementById('orbWrap'),orbState=document.getElementById('orbState'),orbCap=document.getElementById('orbCap');
 const orbTalk=document.getElementById('orbTalk');
 
@@ -261,6 +261,7 @@ function unlockAudio(){  // call from a tap: browsers only start an AudioContext
 }
 let simT0=0;
 function voiceLevel(){
+  if(listening)return Mic.level();   // the orb follows Mike's voice while it listens
   if(curAudio&&curAudio._routed&&analyser){
     analyser.getByteTimeDomainData(abuf);let sum=0;
     for(let i=0;i<abuf.length;i++){const v=(abuf[i]-128)/128;sum+=v*v;}
@@ -383,7 +384,7 @@ async function spPump(){
 const ORB_LABEL={listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
 function orbSet(s){Orb.setState(s);orbState.textContent=ORB_LABEL[s]||'';orbTalk.textContent=s==='listening'?'Done':'Talk now';orbTalk.classList.toggle('listening',s==='listening');}
 function startConvo(){
-  if(!SR)return;
+  if(!Mic.ok)return;
   convo=true;idleRounds=0;unlockAudio();
   micBtn.classList.add('on');micBtn.title='End the spoken conversation';
   orbWrap.hidden=false;orbCap.className='';orbCap.textContent='';Orb.start(voiceLevel);
@@ -391,70 +392,140 @@ function startConvo(){
 }
 function endConvo(){
   convo=false;
-  if(recog){try{recog.abort()}catch(e){}}
+  Mic.stop(false);listening=false;micBtn.classList.remove('listening');
   stopAudio();Orb.stop();orbWrap.hidden=true;
-  micBtn.classList.remove('on','listening');micBtn.title='Start a spoken conversation (Chrome); tap again to end';
+  micBtn.classList.remove('on','listening');micBtn.title='Start a spoken conversation; tap again to end';
 }
-const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-if(!SR){micBtn.disabled=true;micBtn.title='Speech recognition needs Chrome';}
-// Join recognition results. Some Chrome builds (seen on Mike's phone 11/4) send each result as the whole
-// transcript so far, so plain concatenation repeats the sentence; a result that already contains the
-// text so far replaces it instead of being appended.
-function joinResults(results,from){
-  const norm=x=>x.toLowerCase().replace(/[^a-z0-9' ]/g,'').replace(/\s+/g,' ').trim();
-  let out='';
-  for(let i=from||0;i<results.length;i++){const t=results[i][0].transcript.trim();if(!t)continue;
-    const a=norm(out),b=norm(t);
-    if(!a||b.startsWith(a))out=t;else if(!a.endsWith(b))out+=' '+t;}
-  return out;
+// ---- Mic: the page records the audio itself and uriel's Whisper (tk-whisper, via /transcribe) writes the
+// words. The phone's own speech-to-text is NOT used: Android's recognizer ends at the slightest pause and cut
+// Mike off mid-sentence (11/5, "it SHOULD NOT use the phones speech to text"). A turn ends only after
+// PAUSE_MS of quiet once he has spoken, or when he taps Done.
+const PAUSE_MS=2500,NOSPEECH_MS=8000,MAX_MS=110000,DICT_PAUSE_MS=1200,DICT_IDLE_MS=60000;
+const Mic=(function(){
+  const RATE=16000,FRAME=2048,PREROLL_MS=500,MIN_SPEECH_MS=250;
+  let ctx=null,stream=null,src=null,node=null,opts=null,on=false,starting=false;
+  let bufs=[],segMs=0,speechMs=0,quietMs=0,idleMs=0,floor=0.004,lvl=0;
+  const ok=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&(window.AudioContext||window.webkitAudioContext));
+  function prime(){  // call from a tap so the context may start
+    try{if(!ctx){const AC=window.AudioContext||window.webkitAudioContext;
+        try{ctx=new AC({sampleRate:RATE});}catch(e){ctx=new AC();}}
+      if(ctx.state==='suspended')ctx.resume().catch(()=>{});}catch(e){ctx=null;}
+  }
+  function resetSeg(){bufs=[];segMs=0;speechMs=0;quietMs=0;idleMs=0;}
+  function pcm(){  // float chunks at ctx.sampleRate -> Int16 at 16 kHz
+    let n=0;for(const b of bufs)n+=b.length;const all=new Float32Array(n);let o=0;for(const b of bufs){all.set(b,o);o+=b.length;}
+    const r=ctx.sampleRate/RATE,m=Math.floor(n/r),out=new Int16Array(m);
+    for(let i=0;i<m;i++){const v=all[Math.floor(i*r)];out[i]=Math.max(-32768,Math.min(32767,Math.round(v*32767)));}
+    return out;
+  }
+  function emit(why){  // hand the segment (or null = nothing said) to the caller and start a fresh one
+    const o=opts,heard=speechMs>=MIN_SPEECH_MS,p=heard?pcm():null;resetSeg();
+    if(o&&o.onSegment)o.onSegment(p,why);
+  }
+  function frame(e){
+    if(!on)return;
+    const x=e.inputBuffer.getChannelData(0),ms=x.length/ctx.sampleRate*1000;
+    let s=0;for(let i=0;i<x.length;i++)s+=x[i]*x[i];const rms=Math.sqrt(s/x.length);
+    lvl=Math.min(1,rms*10);
+    const loud=rms>Math.max(0.012,floor*3);
+    if(loud){speechMs+=ms;quietMs=0;}
+    else{quietMs+=ms;floor=floor*0.95+rms*0.05;}
+    bufs.push(new Float32Array(x));segMs+=ms;
+    const heard=speechMs>=MIN_SPEECH_MS;
+    if(!heard){  // keep only a short lead-in so the first syllable survives, drop older silence
+      idleMs+=ms;
+      while(bufs.length>1&&(bufs.length-1)*ms>PREROLL_MS){bufs.shift();segMs-=ms;}
+      if(!loud)speechMs=Math.max(0,speechMs-ms/2);   // a lone click never adds up to speech
+      if(opts.noSpeechMs&&idleMs>=opts.noSpeechMs)emit('nospeech');
+      return;
+    }
+    if(quietMs>=opts.pauseMs)emit('pause');
+    else if(segMs>=opts.maxMs)emit('max');
+  }
+  async function start(o){
+    if(on||starting)return;
+    starting=true;opts=o;prime();
+    try{
+      if(!ctx)throw new Error('audio is not available in this browser');
+      const st=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+      if(opts!==o){st.getTracks().forEach(t=>t.stop());return;}   // stopped while the mic was opening
+      stream=st;if(ctx.state!=='running')await ctx.resume().catch(()=>{});
+      src=ctx.createMediaStreamSource(stream);node=ctx.createScriptProcessor(FRAME,1,1);
+      node.onaudioprocess=frame;src.connect(node);node.connect(ctx.destination);   // output stays silent
+      resetSeg();on=true;
+    }finally{starting=false;}
+  }
+  function stop(flush){  // flush=true hands over what was said so far
+    const o=opts,wasOn=on;
+    if(wasOn&&flush&&speechMs>=MIN_SPEECH_MS)emit('stop');
+    on=false;opts=null;lvl=0;
+    try{if(node){node.onaudioprocess=null;node.disconnect();}if(src)src.disconnect();}catch(e){}
+    if(stream)stream.getTracks().forEach(t=>t.stop());
+    node=src=stream=null;resetSeg();
+    return o;
+  }
+  function finish(){if(!on)return;emit(speechMs>=MIN_SPEECH_MS?'done':'nospeech');}   // "Done": end this turn now
+  return {ok,prime,start,stop,finish,level:()=>on?lvl:0,active:()=>on||starting};
+})();
+function transcribe(p){
+  return fetch('/transcribe',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:p.buffer})
+    .then(r=>r.ok?r.json():r.text().then(t=>{throw new Error('HTTP '+r.status+(t?': '+t.slice(0,120):''))}))
+    .then(j=>(j.text||'').replace(/\s+/g,' ').trim());
 }
+if(!Mic.ok){micBtn.disabled=true;micBtn.title='This browser cannot record audio';}
+
+let transcribing=false;
+function micFail(e){add('error','Mic: '+((e&&e.name==='NotAllowedError')?'permission denied':(e&&e.message)||e));}
 function startListening(){
-  if(!SR||listening)return;
+  if(!Mic.ok||listening||transcribing)return;
   stopAudio();
-  // continuous: Chrome keeps listening through pauses; we end the turn after PAUSE_MS of no new words (Mike 11/4)
-  recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=true;
-  let final='',fatal=false,quiet=null;
-  const PAUSE_MS=2500;
-  recog.onresult=e=>{
-    final=joinResults([...e.results].filter(r=>r.isFinal));input.value=joinResults(e.results).replace(/\s+/g,' ').trim();orbCap.className='';orbCap.textContent=input.value;
-    clearTimeout(quiet);quiet=setTimeout(()=>{if(recog)recog.stop();},PAUSE_MS);};
-  recog.onerror=e=>{if(e.error==='not-allowed'||e.error==='service-not-allowed'||e.error==='audio-capture')fatal=true;
-    if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
-  recog.onend=()=>{clearTimeout(quiet);listening=false;micBtn.classList.remove('listening');recog=null;
-    if(!convo)return;
-    const t=input.value.trim();
-    if(t&&(final.trim()||t)&&!sendBtn.disabled){idleRounds=0;input.value='';send(t);return;}
-    if(fatal){endConvo();return;}
-    // Nothing heard: keep listening a couple more rounds, then end the conversation.
+  listening=true;micBtn.classList.add('listening');if(convo){orbSet('listening');orbCap.className='';orbCap.textContent='';}
+  Mic.start({pauseMs:PAUSE_MS,noSpeechMs:NOSPEECH_MS,maxMs:MAX_MS,onSegment:(p)=>{Mic.stop(false);gotTurn(p);}})
+    .catch(e=>{listening=false;micBtn.classList.remove('listening');micFail(e);endConvo();});
+}
+function gotTurn(p){  // p = 16 kHz PCM of what was said, or null when nothing was
+  listening=false;micBtn.classList.remove('listening');
+  if(!convo)return;
+  if(!p){
     if(++idleRounds<=2&&!sendBtn.disabled)startListening();
     else if(!sendBtn.disabled){endConvo();add('sys','Conversation ended (nothing heard).');}
-  };
-  listening=true;micBtn.classList.add('listening');if(convo)orbSet('listening');
-  try{recog.start();}catch(e){listening=false;micBtn.classList.remove('listening');recog=null;}
+    return;
+  }
+  transcribing=true;orbSet('thinking');orbCap.className='';orbCap.textContent='…';
+  transcribe(p).then(t=>{
+    transcribing=false;if(!convo)return;
+    if(t&&!sendBtn.disabled){idleRounds=0;orbCap.textContent=t;send(t);}
+    else gotTurn(null);
+  }).catch(e=>{transcribing=false;add('error','Mic: could not get the words ('+e.message+')');if(convo)startListening();});
 }
-function stopListening(){if(recog)recog.stop();}
-micBtn.addEventListener('click',()=>{stopDictation();convo?endConvo():startConvo();});
+function stopListening(){Mic.finish();}
+micBtn.addEventListener('click',()=>{stopDictation();Mic.prime();convo?endConvo():startConvo();});
 
-// ---- Dictation (Mike 11/4): speak to type into the box; nothing is sent or spoken. Tap again to stop. ----
-const dictBtn=document.getElementById('dict');let dict=null;
-if(!SR){dictBtn.disabled=true;dictBtn.title='Speech recognition needs Chrome';}
-function stopDictation(){if(dict){try{dict.stop()}catch(e){}}}
-function startDictation(){
-  if(!SR||dict||convo)return;
-  const base=input.value.replace(/\s+$/,'');
-  dict=new SR();dict.lang='en-US';dict.interimResults=true;dict.continuous=true;
-  dict.onresult=e=>{const t=joinResults(e.results).replace(/\s+/g,' ').trim();
-    input.value=(base?base+' ':'')+t;input.dispatchEvent(new Event('input'));};
-  dict.onerror=e=>{if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
-  dict.onend=()=>{dict=null;dictBtn.classList.remove('listening');dictBtn.title='Dictate: speak to type into the box (Chrome); tap again to stop';input.focus();};
-  dictBtn.classList.add('listening');dictBtn.title='Stop dictating';
-  try{dict.start();}catch(e){dict=null;dictBtn.classList.remove('listening');}
+// ---- Dictation (Mike 11/4): speak to type into the box; nothing is sent or spoken. Tap again to stop.
+// Each pause sends that stretch to Whisper and its words are added to the box in order. ----
+const dictBtn=document.getElementById('dict');let dictOn=false,dictChain=Promise.resolve();
+const DICT_TITLE='Dictate: speak to type into the box; tap again to stop';
+if(!Mic.ok){dictBtn.disabled=true;dictBtn.title='This browser cannot record audio';}
+function dictAdd(p){
+  dictChain=dictChain.then(()=>transcribe(p)).then(t=>{
+    if(!t)return;const cur=input.value.replace(/\s+$/,'');
+    input.value=(cur?cur+' ':'')+t;input.dispatchEvent(new Event('input'));
+  }).catch(e=>add('error','Mic: could not get the words ('+e.message+')'));
 }
-dictBtn.addEventListener('click',()=>dict?stopDictation():startDictation());
+function dictDone(){dictOn=false;dictBtn.classList.remove('listening');dictBtn.title=DICT_TITLE;input.focus();}
+function stopDictation(){if(!dictOn)return;Mic.stop(true);dictDone();}
+function startDictation(){
+  if(!Mic.ok||dictOn||convo)return;
+  dictOn=true;dictBtn.classList.add('listening');dictBtn.title='Stop dictating';
+  Mic.start({pauseMs:DICT_PAUSE_MS,noSpeechMs:DICT_IDLE_MS,maxMs:MAX_MS,
+             onSegment:(p,why)=>{if(p)dictAdd(p);else if(why==='nospeech'){Mic.stop(false);dictDone();}}})
+    .catch(e=>{micFail(e);dictDone();});
+}
+dictBtn.addEventListener('click',()=>{Mic.prime();dictOn?stopDictation():startDictation();});
 document.getElementById('orb').addEventListener('click',endConvo);
 document.getElementById('orbEnd').addEventListener('click',endConvo);
 // "Talk now" interrupts the reply and listens; while listening, "Done" sends what was heard.
-orbTalk.addEventListener('click',()=>{unlockAudio();if(listening)stopListening();else if(!sendBtn.disabled){idleRounds=0;startListening();}});
+orbTalk.addEventListener('click',()=>{unlockAudio();Mic.prime();if(listening)stopListening();else if(!sendBtn.disabled){idleRounds=0;startListening();}});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&convo)endConvo();});
 
 // ---- The orb: a small star (port of the Astrid tablet's OrbView.java): bright core, boiling
