@@ -285,7 +285,19 @@ function chunkText(t){
   if(cur)out.push(cur);return out;
 }
 function fetchTts(text){return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,voice:voiceName})}).then(r=>r.ok?r.blob():null).catch(()=>null);}
-function playBlob(blob){return new Promise(res=>{const a=new Audio(URL.createObjectURL(blob));curAudio=a;
+// Speaker wake (Mike 2026-11-06): the Surface Go's sound chip powers down after ~10 s of silence and
+// clicks/clips the first word when it wakes. After a quiet spell, play 300 ms of silence first.
+let lastAudioEnd=0,silentUrl=null;
+function silentWav(ms){const rate=22050,n=Math.round(rate*ms/1000),b=new ArrayBuffer(44+n*2),v=new DataView(b);
+  const w=(o,t)=>{for(let i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i));};
+  w(0,'RIFF');v.setUint32(4,36+n*2,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*2,true);
+  return URL.createObjectURL(new Blob([b],{type:'audio/wav'}));}
+function wakeSpeakers(){if(Date.now()-lastAudioEnd<3000)return Promise.resolve();
+  if(!silentUrl)silentUrl=silentWav(300);
+  return new Promise(res=>{const a=new Audio(silentUrl);a.onended=res;a.onerror=res;a.play().catch(res);setTimeout(res,800);});}
+function playBlob(blob){const g=speakGen;return wakeSpeakers().then(()=>g===speakGen?playBlobNow(blob):null).finally(()=>{lastAudioEnd=Date.now();});}
+function playBlobNow(blob){return new Promise(res=>{const a=new Audio(URL.createObjectURL(blob));curAudio=a;
   // Only route through WebAudio when the context is running; a suspended context would mute the reply.
   if(actx&&analyser&&actx.state==='running'){try{actx.createMediaElementSource(a).connect(analyser);a._routed=true;}catch(e){}}
   a.onplaying=()=>{if(convo)orbSet('speaking');};
