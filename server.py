@@ -568,6 +568,16 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"stop requested session={s.sid[:8]}")
             self._send(b'{"ok":true}', "application/json")
             return
+        if self.path == "/miclog":   # one line per listening round from the page (Mike 11/6: find why the orb closed)
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 2048:
+                try:
+                    d = json.loads(self.rfile.read(n))
+                    log("mic " + " ".join(f"{k}={str(v)[:60]}" for k, v in list(d.items())[:20]))
+                except ValueError:
+                    pass
+            self._send(b'{"ok":true}', "application/json")
+            return
         if self.path not in ("/chat", "/tts", "/upload", "/transcribe"):
             self.send_error(404)
             return
@@ -577,6 +587,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400)
                 return
             try:
+                seg = (self.headers.get("X-Seg") or "")[:120]
+                if seg:
+                    log(f"stt seg {seg}")   # why the page ended the turn (pause/done/max) + its timings
                 text = whisper_text(self.rfile.read(n))
             except Exception as e:
                 log(f"stt error: {e}")
