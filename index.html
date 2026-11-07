@@ -443,7 +443,7 @@ const Mic=(function(){
   const NOISE_WIN=31;   // ~4 s of frames: the quietest one in that window is the steady background (road noise)
   let ctx=null,stream=null,src=null,node=null,opts=null,on=false,starting=false;
   let bufs=[],segMs=0,speechMs=0,quietMs=0,idleMs=0,floor=0.004,lvl=0,echo=0.01,bargeMs=0,st=null,armT=0;
-  let recent=[];
+  let recent=[],loudRun=0;
   const ok=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&(window.AudioContext||window.webkitAudioContext));
   function prime(){  // call from a tap so the context may start
     try{if(!ctx){const AC=window.AudioContext||window.webkitAudioContext;
@@ -497,11 +497,14 @@ const Mic=(function(){
     // every frame counted as speech and the turn ran until Done. A steady hum sets the minimum of the last ~4 s;
     // lift the floor to it. Speech has gaps, so it rarely lifts the minimum (keeps the 11/6 tail fix intact).
     recent.push(rms);if(recent.length>NOISE_WIN)recent.shift();
-    if(recent.length===NOISE_WIN){const m=Math.min(...recent);if(m>floor)floor=m;}
+    // 11/6 drive 2: the minimum sat below the hum's usual level and half the frames still read loud; use the
+    // 20th percentile of the window instead (speech gaps still keep it near the background).
+    if(recent.length===NOISE_WIN){const q=recent.slice().sort((a,b)=>a-b)[Math.floor(NOISE_WIN*0.2)];if(q>floor)floor=q;}
     const talking=speechMs>=MIN_SPEECH_MS;
     const loud=rms>(talking?Math.max(TAIL_MIN,floor*TAIL_X):Math.max(0.012,floor*3));
-    if(loud){speechMs+=ms;quietMs=0;if(st)st.loud++;}
-    else{quietMs+=ms;if(!talking)floor=floor*0.95+rms*0.05;}
+    // Once he is talking, one loud frame (a road bump) no longer restarts the pause clock; two in a row (~250 ms) do.
+    if(loud){speechMs+=ms;loudRun++;if(!talking||loudRun>=2)quietMs=0;else quietMs+=ms;if(st)st.loud++;}
+    else{loudRun=0;quietMs+=ms;if(!talking)floor=floor*0.95+rms*0.05;}
     const heard=speechMs>=MIN_SPEECH_MS;
     if(!heard){  // keep only a short lead-in so the first syllable survives, drop older silence
       idleMs+=ms;keepLeadIn(ms);
