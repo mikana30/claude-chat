@@ -415,7 +415,7 @@ const ORB_LABEL={listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
 function orbSet(s){Orb.setState(s);orbState.textContent=ORB_LABEL[s]||'';orbTalk.textContent=s==='listening'?'Done':'Talk now';orbTalk.classList.toggle('listening',s==='listening');}
 function startConvo(){
   if(!Mic.ok)return;
-  convo=true;idleRounds=0;unlockAudio();
+  convo=true;idleRounds=0;unlockAudio();Vad.load();
   micBtn.classList.add('on');micBtn.title='End the spoken conversation';
   orbWrap.hidden=false;orbCap.className='';orbCap.textContent='';Orb.start(voiceLevel);
   if(sendBtn.disabled)orbSet('thinking');else startListening();
@@ -437,13 +437,50 @@ function endConvo(){
 // silence ends the conversation only after CONVO_IDLE_MS and says so aloud; while Astrid speaks the mic listens
 // for him to cut in (barge-in) above a threshold that tracks her own echo, then stops her and keeps his words.
 const PAUSE_MS=2500,CONVO_IDLE_MS=120000,MAX_MS=110000,DICT_PAUSE_MS=1200,DICT_IDLE_MS=60000;
+// ---- Speech detector (Mike 11/6, driving): loudness alone can't tell his voice from road noise, which changes
+// all the time, so the turn never ended. Silero VAD (a small speech-vs-noise model, run in the page with
+// onnxruntime-web from /vad/) now decides what counts as talking; loudness is only the fallback until it loads
+// or if it fails. Tested 11/6 on speech over synthetic road noise up to 0.19 rms: speech ~0.8, silence after < 0.05.
+// Streaming Silero VAD v6 (16 kHz): 512-sample chunks with 64 samples of context, h/c carried between chunks.
+function makeVad(ort,session){
+  let h=new Float32Array(128),c=new Float32Array(128),ctxS=new Float32Array(64),pend=new Float32Array(0),chain=Promise.resolve();
+  const out=[];  // {t,p}
+  function push(x16,now,onProb){  // x16: Float32Array at 16 kHz
+    const a=new Float32Array(pend.length+x16.length);a.set(pend);a.set(x16,pend.length);
+    let o=0;
+    while(a.length-o>=512){
+      const inp=new Float32Array(576);inp.set(ctxS);inp.set(a.subarray(o,o+512),64);
+      ctxS=a.slice(o+448,o+512);o+=512;
+      chain=chain.then(async()=>{
+        const r=await session.run({input:new ort.Tensor('float32',inp,[1,576]),h:new ort.Tensor('float32',h,[1,1,128]),c:new ort.Tensor('float32',c,[1,1,128])});
+        h=r.hn.data.slice();c=r.cn.data.slice();
+        const p=r.speech_probs.data[0];if(onProb)onProb(p,now);return p;
+      }).catch(()=>{});
+    }
+    pend=a.slice(o);
+    return chain;
+  }
+  function reset(){h=new Float32Array(128);c=new Float32Array(128);ctxS=new Float32Array(64);pend=new Float32Array(0);}
+  return {push,reset};
+}
+const Vad={ready:false,loading:null,ort:null,session:null,
+  load(){
+    if(this.loading)return this.loading;
+    this.loading=new Promise((res,rej)=>{const sc=document.createElement('script');sc.src='/vad/ort.wasm.min.js';sc.onload=res;sc.onerror=()=>rej(new Error('vad script'));document.head.appendChild(sc);})
+      .then(async()=>{const ort=window.ort;ort.env.wasm.numThreads=1;ort.env.wasm.wasmPaths='/vad/';
+        this.session=await ort.InferenceSession.create('/vad/silero_vad_v6.onnx');this.ort=ort;this.ready=true;})
+      .catch(e=>{this.loading=null;fetch('/miclog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({why:'vad-load-failed',err:String(e)})}).catch(()=>{});});
+    return this.loading;
+  },
+  make(){return this.ready?makeVad(this.ort,this.session):null;}};
+const VAD_START=0.5,VAD_HOLD=0.35;   // probability that starts a turn / keeps it going
 const Mic=(function(){
   const RATE=16000,FRAME=2048,PREROLL_MS=500,MIN_SPEECH_MS=250,TAIL_MIN=0.005,TAIL_X=1.8;
   const BARGE_MIN=0.04,BARGE_X=3,BARGE_MS=350,BARGE_LEARN_MS=800;
   const NOISE_WIN=31;   // ~4 s of frames: the quietest one in that window is the steady background (road noise)
   let ctx=null,stream=null,src=null,node=null,opts=null,on=false,starting=false;
   let bufs=[],segMs=0,speechMs=0,quietMs=0,idleMs=0,floor=0.004,lvl=0,echo=0.01,bargeMs=0,st=null,armT=0;
-  let recent=[],loudRun=0;
+  let recent=[],loudRun=0,vad=null,vadAcc=0,vadGot=false,vadLast=0,vadPeak=0;
   const ok=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&(window.AudioContext||window.webkitAudioContext));
   function prime(){  // call from a tap so the context may start
     try{if(!ctx){const AC=window.AudioContext||window.webkitAudioContext;
@@ -455,10 +492,10 @@ const Mic=(function(){
     if(!st)return;const tr=stream&&stream.getAudioTracks()[0],o=opts||{};
     const d={why,mode:o.barge?'barge':(o.mode||'listen'),ms:Date.now()-st.t0,frames:st.frames,
       peak:st.peak.toFixed(4),avg:(st.frames?st.sum/st.frames:0).toFixed(4),loudFrames:st.loud,speechMs:Math.round(speechMs),
-      floor:floor.toFixed(4),echo:echo.toFixed(4),ctx:ctx?ctx.state+'@'+ctx.sampleRate:'none',
+      floor:floor.toFixed(4),echo:echo.toFixed(4),vad:vad?'on':(Vad.ready?'ready':'off'),vadPeak:vadPeak.toFixed(2),ctx:ctx?ctx.state+'@'+ctx.sampleRate:'none',
       track:tr?`${tr.readyState}${tr.muted?'/muted':''}${tr.enabled?'':'/disabled'}`:'none',vis:document.visibilityState};
     fetch('/miclog',{method:'POST',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).catch(()=>{});
-    newStats();
+    newStats();vadPeak=0;
   }
   function resetSeg(){bufs=[];segMs=0;speechMs=0;quietMs=0;idleMs=0;bargeMs=0;}
   function pcm(){  // float chunks at ctx.sampleRate -> Int16 at 16 kHz
@@ -500,10 +537,15 @@ const Mic=(function(){
     // 11/6 drive 2: the minimum sat below the hum's usual level and half the frames still read loud; use the
     // 20th percentile of the window instead (speech gaps still keep it near the background).
     if(recent.length===NOISE_WIN){const q=recent.slice().sort((a,b)=>a-b)[Math.floor(NOISE_WIN*0.2)];if(q>floor)floor=q;}
+    if(!vad&&Vad.ready)vad=Vad.make();
+    if(vad){let x16=x;if(ctx.sampleRate!==16000){const r=ctx.sampleRate/16000,m=Math.floor(x.length/r);x16=new Float32Array(m);for(let i=0;i<m;i++)x16[i]=x[Math.floor(i*r)];}
+      vad.push(x16,0,p=>{vadAcc=Math.max(vadAcc,p);vadGot=true;});}
+    const vp=vadGot?vadAcc:vadLast;vadLast=vp;vadAcc=0;vadGot=false;if(vp>vadPeak)vadPeak=vp;
     const talking=speechMs>=MIN_SPEECH_MS;
     // 11/6 drive 3: with the floor at road level (0.19), floor*3 put the start bar above his voice (peak 0.34) and the
     // mic heard nothing. Above a quiet room the margin is capped as an amount over the floor, not a multiple of it.
-    const loud=rms>(talking?Math.max(TAIL_MIN,Math.min(floor*TAIL_X,floor+0.03)):Math.max(0.012,Math.min(floor*3,floor+0.05)));
+    const loud=vad?vp>(talking?VAD_HOLD:VAD_START)
+      :rms>(talking?Math.max(TAIL_MIN,Math.min(floor*TAIL_X,floor+0.03)):Math.max(0.012,Math.min(floor*3,floor+0.05)));
     // Once he is talking, one loud frame (a road bump) no longer restarts the pause clock; two in a row (~250 ms) do.
     if(loud){speechMs+=ms;loudRun++;if(!talking||loudRun>=2)quietMs=0;else quietMs+=ms;if(st)st.loud++;}
     else{loudRun=0;quietMs+=ms;if(!talking)floor=floor*0.95+rms*0.05;}
@@ -528,7 +570,7 @@ const Mic=(function(){
       stream=sm;if(ctx.state!=='running')await ctx.resume().catch(()=>{});
       src=ctx.createMediaStreamSource(stream);node=ctx.createScriptProcessor(FRAME,1,1);
       node.onaudioprocess=frame;src.connect(node);node.connect(ctx.destination);   // output stays silent
-      resetSeg();newStats();armT=Date.now();echo=0.01;on=true;
+      resetSeg();newStats();armT=Date.now();echo=0.01;vad=Vad.make();vadLast=0;on=true;
     }catch(e){opts=null;throw e;}
     finally{starting=false;}
   }
@@ -539,7 +581,7 @@ const Mic=(function(){
     on=false;opts=null;lvl=0;
     try{if(node){node.onaudioprocess=null;node.disconnect();}if(src)src.disconnect();}catch(e){}
     if(stream)stream.getTracks().forEach(t=>t.stop());
-    node=src=stream=null;resetSeg();st=null;
+    node=src=stream=null;resetSeg();st=null;vad=null;
     return o;
   }
   function finish(){if(!on)return;emit(speechMs>=MIN_SPEECH_MS?'done':'nospeech');}   // "Done": end this turn now

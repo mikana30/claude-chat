@@ -467,6 +467,10 @@ def reaper():
                     del _sessions[s.sid]
 
 
+VAD_FILES = {"ort.wasm.min.js": "text/javascript", "ort-wasm-simd-threaded.mjs": "text/javascript",
+             "ort-wasm-simd-threaded.wasm": "application/wasm", "silero_vad_v6.onnx": "application/octet-stream"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -529,6 +533,16 @@ class Handler(BaseHTTPRequestHandler):
                                     f'<title>{APP_NAME}</title><link rel="manifest" href="/manifest.json">'
                                     f'<meta name="theme-color" content="#101420">'.encode(), 1)
             self._send(html, "text/html; charset=utf-8")
+        elif self.path.startswith("/vad/") and self.path[5:] in VAD_FILES:
+            # Speech detector for the mic (Mike 11/6: road noise kept the turn open). Fixed allowlist, cached a week.
+            with open(os.path.join(HERE, "vad", self.path[5:]), "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", VAD_FILES[self.path[5:]])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, max-age=604800")
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/config":
             self._send(json.dumps({"model": MODEL, "effort": EFFORT, "cwd": WORKDIR,
                                    "permission_mode": PERMISSION_MODE,
