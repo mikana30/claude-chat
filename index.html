@@ -440,8 +440,10 @@ const PAUSE_MS=2500,CONVO_IDLE_MS=120000,MAX_MS=110000,DICT_PAUSE_MS=1200,DICT_I
 const Mic=(function(){
   const RATE=16000,FRAME=2048,PREROLL_MS=500,MIN_SPEECH_MS=250,TAIL_MIN=0.005,TAIL_X=1.8;
   const BARGE_MIN=0.04,BARGE_X=3,BARGE_MS=350,BARGE_LEARN_MS=800;
+  const NOISE_WIN=31;   // ~4 s of frames: the quietest one in that window is the steady background (road noise)
   let ctx=null,stream=null,src=null,node=null,opts=null,on=false,starting=false;
   let bufs=[],segMs=0,speechMs=0,quietMs=0,idleMs=0,floor=0.004,lvl=0,echo=0.01,bargeMs=0,st=null,armT=0;
+  let recent=[];
   const ok=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&(window.AudioContext||window.webkitAudioContext));
   function prime(){  // call from a tap so the context may start
     try{if(!ctx){const AC=window.AudioContext||window.webkitAudioContext;
@@ -491,6 +493,11 @@ const Mic=(function(){
       }
       return;
     }
+    // Mike 11/6 (driving): road noise never gave a quiet frame, so the floor stayed at the parked-car level,
+    // every frame counted as speech and the turn ran until Done. A steady hum sets the minimum of the last ~4 s;
+    // lift the floor to it. Speech has gaps, so it rarely lifts the minimum (keeps the 11/6 tail fix intact).
+    recent.push(rms);if(recent.length>NOISE_WIN)recent.shift();
+    if(recent.length===NOISE_WIN){const m=Math.min(...recent);if(m>floor)floor=m;}
     const talking=speechMs>=MIN_SPEECH_MS;
     const loud=rms>(talking?Math.max(TAIL_MIN,floor*TAIL_X):Math.max(0.012,floor*3));
     if(loud){speechMs+=ms;quietMs=0;if(st)st.loud++;}
