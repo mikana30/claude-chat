@@ -754,6 +754,10 @@ const Orb=(function(){
 
 async function send(text,items){
   try{localStorage.setItem('claude-chat-last',String(Date.now()))}catch(e){}
+  // Mike 11/6: a turn lost while he was in Messenger left this watcher polling; when the NEXT turn finished it
+  // reloaded the chat, and openSession's stopAudio cut her spoken reply off after two sentences. A new turn
+  // streams live, so the old watcher has nothing left to recover.
+  if(lostWait){clearInterval(lostWait);lostWait=null;}
   spReset();replyText='';
   if(convo&&!listening&&Mic.barging())Mic.stop(false);
   const meB=add('msg me',items&&items.length?text.replace(/\n\n\[Attached[\s\S]*$/,''):text);
