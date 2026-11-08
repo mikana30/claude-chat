@@ -347,6 +347,8 @@ def catalog_models():
 # or the page asks for a different model/effort (those are process flags). Idle processes are
 # reaped after PROC_IDLE_S so they are not holding memory; the next turn resumes the session.
 PROC_IDLE_S = int(os.environ.get("CHAT_PROC_IDLE_S", "1800"))
+PROC_BUSY_MAX_S = int(os.environ.get("CHAT_PROC_BUSY_MAX_S", str(12 * 3600)))  # busy or not, stop after this idle
+BUSY_CPU_S = 0.5   # CPU seconds per reaper minute that count as "still working"
 PROC_MAX = int(os.environ.get("CHAT_PROC_MAX", "2"))
 TURN_TIMEOUT_S = int(os.environ.get("CHAT_TURN_TIMEOUT_S", "900"))
 EOF = object()
@@ -382,6 +384,7 @@ class Session:
         self.prompt_mtime = None      # astrid.md as loaded; a change restarts the process (Astrid's rule)
         self.lock = threading.Lock()  # held for the whole turn
         self.last = time.time()
+        self.busy = False             # background work seen at the last reaper check (agents, tools)
 
     def alive(self):
         return self.p is not None and self.p.poll() is None
@@ -466,7 +469,7 @@ def get_session(sid):
             s = Session(sid, resume=True) if sid else Session(str(uuid.uuid4()), resume=False)
             _sessions[s.sid] = s
         s.last = time.time()
-        idle = [o for o in _sessions.values() if o is not s and o.alive() and not o.lock.locked()]
+        idle = [o for o in _sessions.values() if o is not s and o.alive() and not o.lock.locked() and not o.busy]
         idle.sort(key=lambda o: o.last)
         while len(idle) + 1 > PROC_MAX and idle:      # LRU: keep memory flat on the Go
             o = idle.pop(0)
@@ -475,12 +478,40 @@ def get_session(sid):
         return s
 
 
+def _proc_busy(s):
+    """True if an idle-looking session still has work going: background agents or tools.
+    Mike 11/8: the 30-min idle stop killed a background agent mid-job (the clip collector, 00:28 on the Go).
+    Signs of work: a running tool command (Claude's Bash tool: a child shell sourcing a shell-snapshot), or CPU used since the last check
+    (an agent streaming from the API keeps the process busy even with no child)."""
+    pid = s.p.pid
+    try:
+        kids = []
+        for k in open(f"/proc/{pid}/task/{pid}/children").read().split():
+            try:   # only tool commands count; MCP servers (node, python) are children for the whole life
+                if b"shell-snapshots" in open(f"/proc/{k}/cmdline", "rb").read():
+                    kids.append(k)
+            except OSError:
+                pass
+        st = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        cpu = (int(st[11]) + int(st[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return False
+    prev, s.cpu_seen = getattr(s, "cpu_seen", None), cpu
+    return bool(kids) or (prev is not None and cpu - prev > BUSY_CPU_S)
+
+
 def reaper():
     while True:
         time.sleep(60)
         now = time.time()
         with _sessions_lock:
             for s in list(_sessions.values()):
+                was = s.busy
+                s.busy = s.alive() and _proc_busy(s)
+                if s.busy and now - s.last > PROC_IDLE_S and now - s.last < PROC_BUSY_MAX_S:
+                    if not was:
+                        log(f"claude kept (idle {int(now - s.last)}s, background work running) session={s.sid[:8]}")
+                    continue
                 if s.alive() and now - s.last > PROC_IDLE_S and s.lock.acquire(blocking=False):
                     try:
                         log(f"claude stop (idle {int(now - s.last)}s) session={s.sid[:8]}")
