@@ -380,9 +380,25 @@ function spText(d){
 function spFlush(){if(spEmo!=='silent'&&spBuf.trim())spPut(spBuf);spBuf='';}
 // Same order as the tablet (brain.py): flush what was said, then the acknowledgement only if nothing was.
 function spTool(){if(!convo||spEmo==='silent')return;spFlush();if(spQueued===0)spPut(ACK);}
+// Astrid's voice takes ~3 s per 100 characters to synthesize (measured 11/8), so a long sentence left a
+// silent gap before it played. Long sentences go out in clause-sized pieces split at , ; : or a dash.
+const CLAUSE_MAX=90,CLAUSE_MIN=25;
+function clauses(t){
+  if(t.length<=CLAUSE_MAX)return[t];
+  const parts=t.split(/(?<=[,;:])\s+|\s+(?=[—–-]\s)/);const out=[];let cur='';
+  for(const p of parts){
+    if(cur&&(cur.length>=CLAUSE_MIN&&cur.length+p.length+1>CLAUSE_MAX)){out.push(cur);cur='';}
+    cur=cur?cur+' '+p:p;}
+  if(cur){if(out.length&&cur.length<CLAUSE_MIN)out[out.length-1]+=' '+cur;else out.push(cur);}
+  // A long stretch with no clause mark is cut before "and", "but", "so" or "which", else at a space.
+  return out.flatMap(c=>{const r=[];while(c.length>CLAUSE_MAX*1.5){
+    let i=c.slice(0,CLAUSE_MAX).search(/\s(?:and|but|so|which|because)\s(?!.*\s(?:and|but|so|which|because)\s)/);
+    if(i<CLAUSE_MIN)i=c.lastIndexOf(' ',CLAUSE_MAX);if(i<CLAUSE_MIN)break;
+    r.push(c.slice(0,i));c=c.slice(i+1);}r.push(c);return r;});
+}
 function spPut(t){
   t=speakable(t);if(!t)return;
-  spQueued++;sq.push(t);
+  spQueued++;for(const c of clauses(t))sq.push(c);
   spCap=(spCap?spCap+' ':'')+t;orbCap.className='reply';orbCap.textContent=spCap.length>400?'…'+spCap.slice(-400):spCap;
   spPump();
 }
