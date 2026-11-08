@@ -17,6 +17,14 @@ def log(msg):
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CHAT_PORT", "8090"))
+# Telegram relay (Mike 11/7: reply on Telegram straight into this chat conversation). A second listener on
+# the tailnet address takes POST /relay from the Telegram bridge on uriel (cc-telegram-bot, @CC_Uriel_bot),
+# guarded by a shared secret, and runs the message as a turn in the named session. Each claude process gets
+# CHAT_SESSION_ID and CHAT_RELAY_URL so `chat-telegram` can send a report the bridge routes replies back from.
+RELAY_HOST = os.environ.get("CHAT_RELAY_HOST", "")
+RELAY_PORT = int(os.environ.get("CHAT_RELAY_PORT", "8092"))
+RELAY_SECRET_FILE = os.path.expanduser(os.environ.get("CHAT_RELAY_SECRET_FILE", "~/.config/claude-chat/relay-secret"))
+RELAY_URL = f"http://{RELAY_HOST}:{RELAY_PORT}" if RELAY_HOST else ""
 MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("CHAT_EFFORT", "medium")
 WORKDIR = os.environ.get("CHAT_CWD", os.path.expanduser("~"))
@@ -55,6 +63,17 @@ def message_tag(spoken, device):
     how = "spoken" if spoken else "typed"
     tail = "; your reply is read aloud" if spoken else "; read on screen"
     return f"[{how} by {CHAT_USER} on {device} through the chat app{tail}]"
+
+
+TELEGRAM_TAG = (f"[typed by {CHAT_USER} on Telegram, replying into this chat conversation; your reply is sent "
+                "back to Telegram as plain text: keep it short, no tables, no markdown headings]")
+TELEGRAM_RULES = (
+    f" A message tagged '{TELEGRAM_TAG}' came from {CHAT_USER}'s Telegram via the relay: answer in short plain "
+    "text (it is not read aloud), and he may be away from this computer. To send him a Telegram message he can "
+    "reply to straight into this conversation (a report when a background job finishes, a question), run "
+    "`chat-telegram \"text\"` (or pipe text on stdin); plain telegram-notify messages go to a different bot and "
+    "replies to them never reach this conversation."
+)
 
 
 ASTRID_FRAMING = (
@@ -99,6 +118,8 @@ def system_prompt():
             prompt += ("\n\nNote: this chat runs on " + _hostname + ", not uriel. Astrid's scripts "
                        "(~/astrid-brain/remind.py, dnd.py, look.py, session.py) live on uriel; run them "
                        "over ssh as `ssh mikana@uriel python3 ~/astrid-brain/<script> ...`.\n")
+    if RELAY_URL:
+        prompt += "\n\n" + TELEGRAM_RULES.strip() + "\n"
     return prompt
 
 
@@ -377,6 +398,9 @@ class Session:
     def start(self, model, effort):
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)  # allow spawning from inside a Claude session
+        env["CHAT_SESSION_ID"] = self.sid
+        if RELAY_URL:
+            env["CHAT_RELAY_URL"] = RELAY_URL
         p = subprocess.Popen(build_cmd(self.sid, self.resume, model, effort), cwd=WORKDIR, env=env,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, bufsize=1)
@@ -657,6 +681,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        self._run_turn(session_id, message, tag, model, effort)
+
+    def _run_turn(self, session_id, message, tag, model, effort):
+        """One turn in a session; every event goes through self._sse (SSE to the page, or collected for /relay)."""
         sess = get_session(session_id)
         model, effort = model or MODEL, effort or EFFORT
         waited = time.time()
@@ -763,6 +791,7 @@ class Handler(BaseHTTPRequestHandler):
                     record_session(sid, self.message)
                 except OSError as e:
                     log(f"session index write failed: {e}")
+            self.result_text = ev.get("result") or ""
             self._sse({"type": "done", "session_id": ev.get("session_id"),
                        "is_error": ev.get("is_error", False),
                        "duration_ms": ev.get("duration_ms"),
@@ -770,9 +799,56 @@ class Handler(BaseHTTPRequestHandler):
                        "error": ev.get("result") if ev.get("is_error") else None})
 
 
+class RelayHandler(Handler):
+    """POST /relay from the Telegram bridge: {"session_id", "message"} + X-Relay-Secret.
+    Runs the message as a turn in that session and answers {"text": reply} when the turn ends."""
+
+    def do_GET(self):
+        self.send_error(404)
+
+    def _sse(self, obj):
+        t = obj.get("type")
+        if t == "text":
+            self.parts.append(obj["text"])
+        elif t == "block_end" and self.parts and not self.parts[-1].endswith("\n\n"):
+            self.parts.append("\n\n")
+        elif t == "error":
+            self.err = obj.get("text") or "error"
+        elif t == "status":
+            self.waited_note = obj.get("text")
+
+    def do_POST(self):
+        secret = ""
+        try:
+            secret = open(RELAY_SECRET_FILE).read().strip()
+        except OSError:
+            pass
+        if self.path != "/relay" or not secret or not hmac.compare_digest(self.headers.get("X-Relay-Secret", ""), secret):
+            return self._deny()
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 200000)) or b"{}")
+        except ValueError:
+            return self.send_error(400)
+        sid, message = req.get("session_id") or "", (req.get("message") or "").strip()
+        if not UUID_RE.match(sid) or not message:
+            return self.send_error(400)
+        self.parts, self.err, self.waited_note, self.result_text = [], None, None, ""
+        astrid = astrid_prompt_mtime() is not None
+        log(f"relay from {self.client_address[0]} session={sid[:8]} msg={message[:60]!r}")
+        self._run_turn(sid, message, TELEGRAM_TAG + " " if astrid else "", None, None)
+        text = "".join(self.parts).strip() or self.result_text.strip()
+        body = json.dumps({"text": text, "error": self.err}).encode()
+        self._send(body, "application/json")
+
+
 if __name__ == "__main__":
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
+    if RELAY_HOST:
+        rsrv = ThreadingHTTPServer((RELAY_HOST, RELAY_PORT), RelayHandler)
+        rsrv.daemon_threads = True
+        threading.Thread(target=rsrv.serve_forever, daemon=True).start()
+        log(f"telegram relay listening on {RELAY_URL}")
     threading.Thread(target=preload_voice, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
     print(f"claude-chat: http://{HOST}:{PORT}  model={MODEL} effort={EFFORT} "
