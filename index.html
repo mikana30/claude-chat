@@ -498,7 +498,7 @@ const Mic=(function(){
   const ok=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&(window.AudioContext||window.webkitAudioContext));
   function prime(){  // call from a tap so the context may start
     try{if(!ctx){const AC=window.AudioContext||window.webkitAudioContext;
-        try{ctx=new AC({sampleRate:RATE});}catch(e){ctx=new AC();}}
+        ctx=new AC();}   // native rate: a forced 16 kHz context makes Chrome resample nonstop (pcm() and the VAD downsample themselves)
       if(ctx.state==='suspended')ctx.resume().catch(()=>{});}catch(e){ctx=null;}
   }
   function newStats(){st={t0:Date.now(),frames:0,peak:0,sum:0,loud:0};}
@@ -597,6 +597,7 @@ const Mic=(function(){
     try{if(node){node.onaudioprocess=null;node.disconnect();}if(src)src.disconnect();}catch(e){}
     if(stream)stream.getTracks().forEach(t=>t.stop());
     node=src=stream=null;resetSeg();st=null;vad=null;
+    if(ctx&&ctx.state==='running')ctx.suspend().catch(()=>{});   // idle: release the audio output (a running context burned ~70% of a core)
     return o;
   }
   function finish(){if(!on)return;emit(speechMs>=MIN_SPEECH_MS?'done':'nospeech');}   // "Done": end this turn now
