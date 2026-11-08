@@ -83,6 +83,7 @@
   #orbUi .orbBtns{display:flex;gap:12px;pointer-events:auto}
   #orbUi button{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.22);color:#eef4ff;border-radius:999px;padding:10px 20px}
   #orbTalk.listening{background:#d33;border-color:#d33}
+  #orbMute.on{background:#b26a00;border-color:#b26a00}
   select.pill{font:inherit;font-size:12px;padding:3px 6px;border:1px solid var(--line);border-radius:999px;background:var(--bg);color:var(--fg)}
   #voiceSel{font:inherit;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);max-width:140px}
   @keyframes pulse{50%{opacity:.6}}
@@ -136,7 +137,7 @@
   <div id="orbUi">
     <div id="orbState" aria-live="polite"></div>
     <div id="orbCap"></div>
-    <div class="orbBtns"><button id="orbTalk" type="button">Talk now</button><button id="orbEnd" type="button">End</button></div>
+    <div class="orbBtns"><button id="orbTalk" type="button">Talk now</button><button id="orbMute" type="button" title="Stop listening; she still speaks. Talk now or Unmute to listen again">Mute</button><button id="orbEnd" type="button">End</button></div>
   </div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
@@ -412,7 +413,20 @@ async function spPump(){
 
 // ---- Conversation mode + overlay ----
 const ORB_LABEL={listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
-function orbSet(s){Orb.setState(s);orbState.textContent=ORB_LABEL[s]||'';orbTalk.textContent=s==='listening'?'Done':'Talk now';orbTalk.classList.toggle('listening',s==='listening');}
+// Mute (Mike 11/7): while an agent works the turn is over, so the mic went back to listening and picked up
+// every unrelated conversation in the room. Muted = the mic is closed (browser mic light off) and never reopens
+// by itself; replies are still spoken. "Talk now" or "Unmute" listens again. End clears it.
+let muted=false;
+const orbMute=document.getElementById('orbMute');
+function setMuted(m){
+  muted=m;orbMute.textContent=m?'Unmute':'Mute';orbMute.classList.toggle('on',m);
+  if(m&&listening){Mic.stop(false);listening=false;micBtn.classList.remove('listening');}
+  if(m){if(convo&&!sqBusy&&!transcribing)orbSet(sendBtn.disabled?'thinking':'idle');else orbSet(orbCur);}
+  else if(convo&&!sendBtn.disabled&&!sqBusy&&!transcribing)startListening();
+  else if(convo)orbSet(orbCur);
+}
+let orbCur='idle';
+function orbSet(s){orbCur=s;Orb.setState(s);orbState.textContent=(ORB_LABEL[s]||'')+(muted?((ORB_LABEL[s]?' · ':'')+'Mic muted'):'');orbTalk.textContent=s==='listening'?'Done':'Talk now';orbTalk.classList.toggle('listening',s==='listening');}
 function startConvo(){
   if(!Mic.ok)return;
   convo=true;idleRounds=0;unlockAudio();Vad.load();
@@ -421,7 +435,7 @@ function startConvo(){
   if(sendBtn.disabled)orbSet('thinking');else startListening();
 }
 function endConvo(){
-  convo=false;
+  convo=false;muted=false;orbMute.textContent='Mute';orbMute.classList.remove('on');
   Mic.stop(false);listening=false;micBtn.classList.remove('listening');
   stopAudio();Orb.stop();orbWrap.hidden=true;
   micBtn.classList.remove('on','listening');micBtn.title='Start a spoken conversation; tap again to end';
@@ -568,6 +582,7 @@ const Mic=(function(){
       const sm=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:true}});
       if(!opts){sm.getTracks().forEach(t=>t.stop());return;}   // stopped while the mic was opening
       stream=sm;if(ctx.state!=='running')await ctx.resume().catch(()=>{});
+      if(!opts){sm.getTracks().forEach(t=>t.stop());stream=null;return;}   // stopped (e.g. Mute) while audio resumed
       src=ctx.createMediaStreamSource(stream);node=ctx.createScriptProcessor(FRAME,1,1);
       node.onaudioprocess=frame;src.connect(node);node.connect(ctx.destination);   // output stays silent
       resetSeg();newStats();armT=Date.now();echo=0.01;vad=Vad.make();vadLast=0;on=true;
@@ -599,6 +614,7 @@ function micFail(e){add('error','Mic: '+((e&&e.name==='NotAllowedError')?'permis
 function listenOpts(){return {pauseMs:PAUSE_MS,noSpeechMs:CONVO_IDLE_MS,maxMs:MAX_MS,
   onSegment:(p,why)=>{Mic.stop(false);if(!p&&why==='nospeech')quietEnd();else gotTurn(p);}};}
 function startListening(){
+  if(muted){if(convo&&!sqBusy)orbSet(sendBtn.disabled?'thinking':'idle');return;}
   if(!Mic.ok||listening||transcribing)return;
   stopAudio();
   listening=true;micBtn.classList.add('listening');if(convo){orbSet('listening');orbCap.className='';orbCap.textContent='';}
@@ -665,7 +681,8 @@ dictBtn.addEventListener('click',()=>{Mic.prime();dictOn?stopDictation():startDi
 // Tapping the orb itself does nothing (Mike 11/6: a stray touch closed it); only End closes.
 document.getElementById('orbEnd').addEventListener('click',endConvo);
 // "Talk now" interrupts the reply and listens; while listening, "Done" sends what was heard.
-orbTalk.addEventListener('click',()=>{unlockAudio();Mic.prime();if(listening)stopListening();else if(!sendBtn.disabled){idleRounds=0;startListening();}});
+orbTalk.addEventListener('click',()=>{unlockAudio();Mic.prime();if(listening)stopListening();else if(!sendBtn.disabled){if(muted){muted=false;orbMute.textContent='Mute';orbMute.classList.remove('on');}idleRounds=0;startListening();}});
+orbMute.addEventListener('click',()=>{unlockAudio();Mic.prime();setMuted(!muted);});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&convo)endConvo();});
 
 // ---- The orb: a small star (port of the Astrid tablet's OrbView.java): bright core, boiling
