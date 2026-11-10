@@ -351,6 +351,7 @@ PROC_BUSY_MAX_S = int(os.environ.get("CHAT_PROC_BUSY_MAX_S", str(12 * 3600)))  #
 BUSY_CPU_S = 0.5   # CPU seconds per reaper minute that count as "still working"
 PROC_MAX = int(os.environ.get("CHAT_PROC_MAX", "2"))
 TURN_TIMEOUT_S = int(os.environ.get("CHAT_TURN_TIMEOUT_S", "900"))
+CHROME = os.environ.get("CHAT_CHROME") == "1"  # Claude in Chrome; set only on Mike's service
 EOF = object()
 
 
@@ -367,6 +368,8 @@ def build_cmd(session_id, resume, model=None, effort=None):
         "--permission-mode", PERMISSION_MODE,
         "--append-system-prompt", system_prompt(),
     ]
+    if CHROME:
+        cmd.append("--chrome")
     cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
     return cmd
 

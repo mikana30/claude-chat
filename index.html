@@ -218,7 +218,7 @@ async function openSession(id){
     add('sys',j_busy?'Still working on your last message; it will show here when done.':'Picked up this chat. Keep typing to continue it.');
     if(j_busy)watchBusy();
   }catch(e){add('sys','Resumed this chat (earlier messages could not be shown).');}
-  scroll();input.focus();
+  scroll();focusInput();
 }
 
 
@@ -443,9 +443,26 @@ function setMuted(m){
 }
 let orbCur='idle';
 function orbSet(s){orbCur=s;Orb.setState(s);orbState.textContent=(ORB_LABEL[s]||'')+(muted?((ORB_LABEL[s]?' · ':'')+'Mic muted'):'');orbTalk.textContent=s==='listening'?'Done':'Talk now';orbTalk.classList.toggle('listening',s==='listening');}
+// Mike 11/8: the phone slept mid-conversation and took the conversation with it. A screen wake lock holds the
+// screen on while the orb is open; Android drops it when the page is hidden, so it is taken again on return.
+let wakeLock=null;
+async function keepAwake(){
+  if(!convo||wakeLock||!('wakeLock' in navigator)||document.visibilityState!=='visible')return;
+  try{wakeLock=await navigator.wakeLock.request('screen');wakeLock.addEventListener('release',()=>{wakeLock=null;});}catch(e){}
+}
+function letSleep(){if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null;}}
+// Mike 11/8: the phone's back/home/tiles bar stayed up over the orb. Fullscreen hides it (needs the tap that
+// opens the orb); leaving the conversation leaves fullscreen.
+function goFull(){const d=document.documentElement;if(!document.fullscreenElement&&d.requestFullscreen)d.requestFullscreen({navigationUI:'hide'}).catch(()=>{});}
+function leaveFull(){if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});}
+// Mike 11/8: the on-screen keyboard popped up whenever a reply came in. Never focus the box during a spoken
+// conversation, and on a touch screen only keep focus that is already there (so no keyboard pops up unasked).
+const TOUCH=matchMedia('(pointer:coarse)').matches;
+function focusInput(){if(convo)return;if(TOUCH&&document.activeElement!==input)return;input.focus();}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')keepAwake();});
 function startConvo(){
   if(!Mic.ok)return;
-  convo=true;idleRounds=0;unlockAudio();Vad.load();
+  convo=true;idleRounds=0;unlockAudio();Vad.load();keepAwake();goFull();if(TOUCH)input.blur();
   micBtn.classList.add('on');micBtn.title='End the spoken conversation';
   orbWrap.hidden=false;orbCap.className='';orbCap.textContent='';Orb.start(voiceLevel);
   if(sendBtn.disabled)orbSet('thinking');else startListening();
@@ -453,7 +470,7 @@ function startConvo(){
 function endConvo(){
   convo=false;muted=false;orbMute.textContent='Mute';orbMute.classList.remove('on');
   Mic.stop(false);listening=false;micBtn.classList.remove('listening');
-  stopAudio();Orb.stop();orbWrap.hidden=true;
+  stopAudio();Orb.stop();orbWrap.hidden=true;letSleep();leaveFull();
   micBtn.classList.remove('on','listening');micBtn.title='Start a spoken conversation; tap again to end';
 }
 // ---- Mic: the page records the audio itself and uriel's Whisper (tk-whisper, via /transcribe) writes the
@@ -685,7 +702,7 @@ function dictAdd(p){
     input.value=(cur?cur+' ':'')+t;input.dispatchEvent(new Event('input'));
   }).catch(e=>add('error','Mic: could not get the words ('+e.message+')'));
 }
-function dictDone(){dictOn=false;dictBtn.classList.remove('listening');dictBtn.title=DICT_TITLE;input.focus();}
+function dictDone(){dictOn=false;dictBtn.classList.remove('listening');dictBtn.title=DICT_TITLE;focusInput();}
 function stopDictation(){if(!dictOn)return;Mic.stop(true);dictDone();}
 function startDictation(){
   if(!Mic.ok||dictOn||convo)return;
@@ -895,7 +912,7 @@ async function send(text,items){
   finally{
     clearInterval(tick);
     for(const el of log.querySelectorAll('.msg.ai.cursor')){el.classList.remove('cursor');if(el.classList.contains('status')||!el.textContent.trim())el.remove();}
-    turnOpen=false;setBusy(false);controller=null;input.focus();
+    turnOpen=false;setBusy(false);controller=null;focusInput();
     if(convo&&!sqBusy)startListening();  // nothing left to say (spoken already, error, stop, [silent]): go back to listening
   }
 }
@@ -942,13 +959,13 @@ input.addEventListener('input',()=>{input.style.height='auto';input.style.height
 stopBtn.addEventListener('click',()=>{  // only Stop ends a turn; a dropped connection does not
   if(sessionId)fetch('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId})}).catch(()=>{});
   if(controller)controller.abort();stopAudio();});
-newBtn.addEventListener('click',()=>{closePast();sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
+newBtn.addEventListener('click',()=>{closePast();sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');focusInput();});
 // A chat idle for more than STALE_H hours starts fresh on open (Mike 11/4); old chats stay under Past.
 const STALE_H=4;
 try{const last=+localStorage.getItem('claude-chat-last')||0;
   if(sessionId&&Date.now()-last>STALE_H*3600e3){sessionId=null;localStorage.removeItem('claude-chat-session');}}catch(e){}
 if(sessionId) openSession(sessionId);  // after the voice globals above exist
-input.focus();
+focusInput();
 </script>
 </body>
 </html>
