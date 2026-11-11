@@ -47,6 +47,22 @@ APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
 # "How to speak" rules (emotion tag, no markdown, short) apply only when the reply is read aloud.
 # CHAT_ASTRID_PROMPT=off disables this (a chat that is not Astrid, e.g. Shana's).
 ASTRID_PROMPT_FILE = os.environ.get("CHAT_ASTRID_PROMPT", os.path.expanduser("~/astrid-brain/astrid.md"))
+# Auto-handoff (Mike 2026-11-10, same as Astrid's phone brain since 11/9): once a session's context passes
+# ASTRID_HANDOFF_TOKENS (100k), the reaper has a background claude -p write a handoff (to OpenBrain too); the next
+# turn starts a fresh session whose first message carries it. The old id stays an alias of the new one, so the
+# page, the Telegram relay and /history keep working. On by default only for Mike's chat (CHAT_AUTO_HANDOFF=1/0
+# overrides): the handoff lands in Mike's OpenBrain, and Shana's chat stays private.
+AUTO_HANDOFF = os.environ.get("CHAT_AUTO_HANDOFF", "1" if os.environ.get("CHAT_USER", "Mike") == "Mike" else "0") == "1"
+HANDOFF_MODEL = os.environ.get("CHAT_HANDOFF_MODEL", "claude-opus-5-5")
+HANDOFF_EFFORT = os.environ.get("CHAT_HANDOFF_EFFORT", "medium")
+autohandoff = None
+if AUTO_HANDOFF:
+    try:
+        sys.path.insert(0, os.path.expanduser("~/astrid-brain"))
+        import autohandoff   # noqa: E402  (shared with phone_brain.py)
+    except ImportError:
+        AUTO_HANDOFF = False
+HANDOFF_RE = re.compile(r"^\[Automatic handoff:.*?\[End of handoff\]\s*", re.S)
 TAG_RE = re.compile(r"^\[(spoken|typed) by [^\]]*\]\s*")   # the per-message tag, hidden in history
 
 
@@ -292,15 +308,67 @@ def record_session(session_id, message):
         os.replace(tmp, INDEX_PATH)
 
 
+ALIAS_PATH = INDEX_PATH.replace(".json", "-alias.json")   # old session id -> the fresh one a handoff started
+
+
+def load_aliases():
+    try:
+        with open(ALIAS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve(sid):
+    seen, al = set(), load_aliases()
+    while sid in al and sid not in seen:
+        seen.add(sid)
+        sid = al[sid]
+    return sid
+
+
+def add_alias(old, new):
+    with _index_lock:
+        al = load_aliases()
+        al[old] = new
+        os.makedirs(os.path.dirname(ALIAS_PATH), exist_ok=True)
+        tmp = ALIAS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(al, f)
+        os.replace(tmp, ALIAS_PATH)
+
+
 def list_sessions():
     idx = load_index()
+    al = load_aliases()
     out = [dict(id=k, **v) for k, v in idx.items()
-           if os.path.exists(os.path.join(TRANSCRIPT_DIR, k + ".jsonl"))]
+           if k not in al and os.path.exists(os.path.join(TRANSCRIPT_DIR, k + ".jsonl"))]
     return sorted(out, key=lambda e: e.get("updated", 0), reverse=True)
 
 
 def session_history(session_id):
-    """User prompts and Claude's final reply text per turn, oldest first."""
+    """User prompts and Claude's final reply text per turn, oldest first. A session started by an auto-handoff
+    shows the sessions before it first, then a line where the handoff happened."""
+    session_id = resolve(session_id)
+    chain = [session_id]
+    al = load_aliases()
+    back = {v: k for k, v in al.items()}
+    while chain[0] in back and back[chain[0]] not in chain:
+        chain.insert(0, back[chain[0]])
+    out = []
+    if len(chain) == 1:
+        return _one_history(session_id)        # OSError (404) for an unknown session, as before
+    for i, sid in enumerate(chain):
+        if i:
+            out.append({"role": "sys", "text": "Automatic handoff: a fresh session took over from here."})
+        try:
+            out += _one_history(sid)
+        except OSError:
+            pass
+    return out
+
+
+def _one_history(session_id):
     msgs, reply = [], []
     with open(os.path.join(TRANSCRIPT_DIR, session_id + ".jsonl")) as f:
         for line in f:
@@ -315,7 +383,7 @@ def session_history(session_id):
                 reply = []  # a hook-forced rewrite replaces the earlier draft of this turn
                 if e.get("isMeta"):
                     continue
-                c = TAG_RE.sub("", c)
+                c = TAG_RE.sub("", HANDOFF_RE.sub("", c))
                 msgs.append({"role": "user", "text": c})
                 msgs.append({"role": "assistant", "text": ""})
             elif e.get("type") == "assistant" and isinstance(c, list) and msgs:
@@ -388,6 +456,8 @@ class Session:
         self.lock = threading.Lock()  # held for the whole turn
         self.last = time.time()
         self.busy = False             # background work seen at the last reaper check (agents, tools)
+        self.handoff_started = False  # one handoff per session
+        self.handoff_ready = None     # (body) once the background summary is saved
 
     def alive(self):
         return self.p is not None and self.p.poll() is None
@@ -466,6 +536,7 @@ _sessions_lock = threading.Lock()
 
 
 def get_session(sid):
+    sid = resolve(sid) if sid else sid
     with _sessions_lock:
         s = _sessions.get(sid) if sid else None
         if s is None:
@@ -479,6 +550,58 @@ def get_session(sid):
             log(f"claude stop (over {PROC_MAX} live) session={o.sid[:8]}")
             o.stop()
         return s
+
+
+def handoff_check(s):
+    """Reaper, every minute: start the background summary once the context passes the limit."""
+    if not AUTO_HANDOFF or s.handoff_started or not s.resume:
+        return
+    path = os.path.join(TRANSCRIPT_DIR, s.sid + ".jsonl")
+    tokens = autohandoff.context_tokens(path)
+    if tokens < autohandoff.LIMIT_TOKENS:
+        return
+    s.handoff_started = True
+    t0 = time.time()
+    log(f"handoff start session={s.sid[:8]} tokens={tokens}")
+
+    def work():
+        try:
+            summary = autohandoff.summarize(path, "chat", HANDOFF_MODEL, HANDOFF_EFFORT)
+        except Exception as e:
+            summary = None
+            log(f"handoff error session={s.sid[:8]}: {e}")
+        if not summary:
+            log(f"handoff failed session={s.sid[:8]}; retrying in 10 min")
+            time.sleep(600)
+            s.handoff_started = False
+            return
+        minutes = max(autohandoff.TAIL_MIN, (time.time() - t0) / 60 + autohandoff.TAIL_MIN)
+        _, body = autohandoff.save("chat", summary, autohandoff.tail(path, minutes))
+        s.handoff_ready = body
+        log(f"handoff ready session={s.sid[:8]} in {time.time() - t0:.0f}s")
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def swap_if_ready(sess):
+    """At the start of a turn (lock held): a ready handoff moves the chat to a fresh session. Never while the
+    old process still has background work (agents, tools) running: that would kill it."""
+    if not sess.handoff_ready or (sess.alive() and sess.busy):   # reaper's last view; deferred, never dropped
+        return sess, ""
+    body, sess.handoff_ready = sess.handoff_ready, None
+    new = Session(str(uuid.uuid4()), resume=False)
+    with _sessions_lock:
+        _sessions[new.sid] = new
+    add_alias(sess.sid, new.sid)
+    try:
+        idx = load_index()
+        title = (idx.get(sess.sid) or {}).get("title", "")
+        record_session(new.sid, title or "continued")
+    except OSError:
+        pass
+    sess.stop()
+    log(f"handoff swap {sess.sid[:8]} -> {new.sid[:8]}")
+    return new, autohandoff.first_message(body)
 
 
 def _proc_busy(s):
@@ -511,6 +634,11 @@ def reaper():
             for s in list(_sessions.values()):
                 was = s.busy
                 s.busy = s.alive() and _proc_busy(s)
+                if s.alive() or s.resume:
+                    try:
+                        handoff_check(s)
+                    except Exception as e:
+                        log(f"handoff check error: {e}")
                 if s.busy and now - s.last > PROC_IDLE_S and now - s.last < PROC_BUSY_MAX_S:
                     if not was:
                         log(f"claude kept (idle {int(now - s.last)}s, background work running) session={s.sid[:8]}")
@@ -613,8 +741,9 @@ class Handler(BaseHTTPRequestHandler):
             if not UUID_RE.match(sid):
                 return self.send_error(400)
             try:
-                s = _sessions.get(sid)
-                self._send(json.dumps({"messages": session_history(sid),
+                cur = resolve(sid)
+                s = _sessions.get(cur)
+                self._send(json.dumps({"messages": session_history(sid), "session_id": cur,
                                        "busy": bool(s and s.lock.locked())}).encode(), "application/json")
             except OSError:
                 self.send_error(404)
@@ -634,7 +763,7 @@ class Handler(BaseHTTPRequestHandler):
                 sid = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}").get("session_id")
             except ValueError:
                 sid = None
-            s = _sessions.get(sid) if sid else None
+            s = _sessions.get(resolve(sid)) if sid else None
             if s and s.lock.locked():
                 s.interrupt()
                 log(f"stop requested session={s.sid[:8]}")
@@ -730,13 +859,20 @@ class Handler(BaseHTTPRequestHandler):
         self.n_events = 0
         self.got_result = False
         self.message = message
+        prefix = ""
+        if sess.handoff_ready:
+            old = sess
+            sess, prefix = swap_if_ready(old)
+            if sess is not old:
+                old.lock.release()
+                sess.lock.acquire()
         try:
             started = sess.ensure(model, effort)
             sess.drain()
             log(f"chat start pid={sess.p.pid} session={sess.sid[:8]} new_proc={started} model={model} "
                 f"effort={effort} tag={tag.strip()[:40]!r} msg={message[:60]!r}")
             self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
-            sess.send(tag + message)
+            sess.send(prefix + tag + message)
             deadline = t0 + TURN_TIMEOUT_S
             while True:
                 try:

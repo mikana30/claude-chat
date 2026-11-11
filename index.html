@@ -213,8 +213,9 @@ async function openSession(id){
   log.innerHTML='';
   try{
     const r=await fetch('/history?id='+encodeURIComponent(id));if(!r.ok)throw new Error('HTTP '+r.status);
-    const {messages,busy:j_busy}=await r.json();
-    for(const m of messages){if(m.role==='user')add('msg me',m.text);else{const d=document.createElement('div');d.className='msg ai';render(d,stripEmo(m.text));log.appendChild(d);}}
+    const {messages,busy:j_busy,session_id:cur}=await r.json();
+    if(cur&&cur!==sessionId){sessionId=cur;try{localStorage.setItem('claude-chat-session',cur)}catch(e){}}  // moved on by an auto-handoff
+    for(const m of messages){if(m.role==='user')add('msg me',m.text);else if(m.role==='sys')add('sys',m.text);else{const d=document.createElement('div');d.className='msg ai';render(d,stripEmo(m.text));log.appendChild(d);}}
     add('sys',j_busy?'Still working on your last message; it will show here when done.':'Picked up this chat. Keep typing to continue it.');
     if(j_busy)watchBusy();
   }catch(e){add('sys','Resumed this chat (earlier messages could not be shown).');}
