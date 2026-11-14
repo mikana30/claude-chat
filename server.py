@@ -48,13 +48,13 @@ APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
 # CHAT_ASTRID_PROMPT=off disables this (a chat that is not Astrid, e.g. Shana's).
 ASTRID_PROMPT_FILE = os.environ.get("CHAT_ASTRID_PROMPT", os.path.expanduser("~/astrid-brain/astrid.md"))
 # Auto-handoff (Mike 2026-11-10, same as Astrid's phone brain since 11/9): once a session's context passes
-# ASTRID_HANDOFF_TOKENS (100k), the reaper has a background claude -p write a handoff (to OpenBrain too); the next
+# ASTRID_HANDOFF_TOKENS (120k), the reaper has a background claude -p write a handoff (to OpenBrain too); the next
 # turn starts a fresh session whose first message carries it. The old id stays an alias of the new one, so the
 # page, the Telegram relay and /history keep working. On by default only for Mike's chat (CHAT_AUTO_HANDOFF=1/0
 # overrides): the handoff lands in Mike's OpenBrain, and Shana's chat stays private.
 AUTO_HANDOFF = os.environ.get("CHAT_AUTO_HANDOFF", "1" if os.environ.get("CHAT_USER", "Mike") == "Mike" else "0") == "1"
 HANDOFF_MODEL = os.environ.get("CHAT_HANDOFF_MODEL", "claude-opus-5-5")
-HANDOFF_EFFORT = os.environ.get("CHAT_HANDOFF_EFFORT", "medium")
+HANDOFF_EFFORT = os.environ.get("CHAT_HANDOFF_EFFORT", "medium")   # Mike 2026-11-12: medium kept after 3-scenario test (low weaker at checked/unchecked)
 autohandoff = None
 if AUTO_HANDOFF:
     try:
@@ -457,7 +457,10 @@ class Session:
         self.last = time.time()
         self.busy = False             # background work seen at the last reaper check (agents, tools)
         self.handoff_started = False  # one handoff per session
-        self.handoff_ready = None     # (body) once the background summary is saved
+        self.handoff_ready = None     # (summary, t0, path) once the background summary is written
+        stored = autohandoff.load_ready("chat", sid) if resume else None   # v3 (Mike 2026-11-12): survives a restart
+        if stored:
+            self.handoff_started, self.handoff_ready = True, tuple(stored)
 
     def alive(self):
         return self.p is not None and self.p.poll() is None
@@ -552,17 +555,30 @@ def get_session(sid):
         return s
 
 
+USAGE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage.jsonl")
+
+
+def usage_log(rec):
+    """v2 (Mike 2026-11-12): plan-limit utilisation and per-turn tokens, to measure handoff savings for real."""
+    try:
+        with open(USAGE_LOG, "a") as f:
+            f.write(json.dumps(dict(ts=time.time(), **rec)) + "\n")
+    except OSError:
+        pass
+
+
 def handoff_check(s):
     """Reaper, every minute: start the background summary once the context passes the limit."""
-    if not AUTO_HANDOFF or s.handoff_started or not s.resume:
+    if not AUTO_HANDOFF or s.handoff_started or not s.resume or s.lock.locked():   # v2: only between turns
         return
     path = os.path.join(TRANSCRIPT_DIR, s.sid + ".jsonl")
     tokens = autohandoff.context_tokens(path)
-    if tokens < autohandoff.LIMIT_TOKENS:
+    why = autohandoff.should_handoff(tokens, time.time() - s.last)   # v2 (Mike 2026-11-12): + idle past the cache
+    if not why:
         return
     s.handoff_started = True
     t0 = time.time()
-    log(f"handoff start session={s.sid[:8]} tokens={tokens}")
+    log(f"handoff start session={s.sid[:8]} tokens={tokens} why={why}")
 
     def work():
         try:
@@ -575,9 +591,11 @@ def handoff_check(s):
             time.sleep(600)
             s.handoff_started = False
             return
-        minutes = max(autohandoff.TAIL_MIN, (time.time() - t0) / 60 + autohandoff.TAIL_MIN)
-        _, body = autohandoff.save("chat", summary, autohandoff.tail(path, minutes))
-        s.handoff_ready = body
+        s.handoff_ready = (summary, t0, path)   # v2: the verbatim tail is built at the swap, not here
+        try:
+            autohandoff.store_ready("chat", s.sid, summary, t0, path)
+        except OSError:
+            pass
         log(f"handoff ready session={s.sid[:8]} in {time.time() - t0:.0f}s")
 
     threading.Thread(target=work, daemon=True).start()
@@ -588,7 +606,15 @@ def swap_if_ready(sess):
     old process still has background work (agents, tools) running: that would kill it."""
     if not sess.handoff_ready or (sess.alive() and sess.busy):   # reaper's last view; deferred, never dropped
         return sess, ""
-    body, sess.handoff_ready = sess.handoff_ready, None
+    (summary, t0, path), sess.handoff_ready = sess.handoff_ready, None
+    # v2 (Mike 2026-11-12): tail built now, covering everything since shortly before the summary was written
+    minutes = max(autohandoff.TAIL_MIN, (time.time() - t0) / 60 + autohandoff.TAIL_MIN)
+    try:
+        _, body = autohandoff.save("chat", summary, autohandoff.tail(path, minutes))
+        autohandoff.clear_ready("chat", sess.sid)
+    except Exception as e:        # never take the turn down with it; stay on the old session
+        log(f"handoff save failed session={sess.sid[:8]}: {e}")
+        return sess, ""
     new = Session(str(uuid.uuid4()), resume=False)
     with _sessions_lock:
         _sessions[new.sid] = new
@@ -950,12 +976,17 @@ class Handler(BaseHTTPRequestHandler):
                                "text": (str(c) if c is not None else "")[:300]})
         elif t == "rate_limit_event":
             w = ev.get("rate_limit_info", {}).get("unifiedWindows", {})
+            usage_log({"ev": "rl", "sid": ev.get("session_id"),
+                       "five_hour": w.get("five_hour", {}).get("utilization"),
+                       "seven_day": w.get("seven_day", {}).get("utilization")})
             self._sse({"type": "rl",
                        "five_hour": w.get("five_hour", {}).get("utilization"),
                        "seven_day": w.get("seven_day", {}).get("utilization")})
         elif t == "result":
             self.got_result = True
             sid = ev.get("session_id")
+            usage_log({"ev": "turn", "sid": sid, "usage": ev.get("usage"), "num_turns": ev.get("num_turns"),
+                       "duration_ms": ev.get("duration_ms")})
             if sid and UUID_RE.match(sid):
                 try:
                     record_session(sid, self.message)
