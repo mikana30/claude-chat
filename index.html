@@ -459,7 +459,9 @@ function leaveFull(){if(document.fullscreenElement&&document.exitFullscreen)docu
 // Mike 11/8: the on-screen keyboard popped up whenever a reply came in. Never focus the box during a spoken
 // conversation, and on a touch screen only keep focus that is already there (so no keyboard pops up unasked).
 const TOUCH=matchMedia('(pointer:coarse)').matches;
-function focusInput(){if(convo)return;if(TOUCH&&document.activeElement!==input)return;input.focus();}
+// Mike 11/14: input is disabled during a turn (drops focus), so remember a typed send and give the cursor back.
+let refocus=false;
+function focusInput(){if(convo)return;const r=refocus;refocus=false;if(TOUCH&&!r&&document.activeElement!==input)return;input.focus();}
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')keepAwake();});
 function startConvo(){
   if(!Mic.ok)return;
@@ -950,6 +952,7 @@ async function uploadPending(){
   return lines;
 }
 form.addEventListener('submit',async e=>{e.preventDefault();const t=input.value.trim();if((!t&&!pending.length)||sendBtn.disabled)return;
+  if(!convo)refocus=true;
   if(!pending.length){input.value='';input.style.height='auto';send(t);return;}
   const items=pending;setBusy(true);const note=add('sys','Uploading '+items.length+(items.length>1?' files…':' file…'));
   let lines;try{lines=await uploadPending();}catch(err){note.remove();setBusy(false);add('error',err.message);return;}
