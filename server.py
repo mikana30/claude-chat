@@ -63,7 +63,33 @@ if AUTO_HANDOFF:
     except ImportError:
         AUTO_HANDOFF = False
 HANDOFF_RE = re.compile(r"^\[Automatic handoff:.*?\[End of handoff\]\s*", re.S)
-TAG_RE = re.compile(r"^\[(spoken|typed) by [^\]]*\]\s*")   # the per-message tag, hidden in history
+# Voice ID (Mike 2026-11-16: same on every device). ~/astrid-brain/chat_voice.py, shared with the Go's copy.
+try:
+    sys.path.insert(0, os.path.expanduser("~/astrid-brain"))
+    import chat_voice   # noqa: E402
+except Exception:
+    chat_voice = None
+VOICEID = bool(chat_voice and chat_voice.ENABLED)
+TAG_RE = re.compile(r"^\[(spoken|typed) (?:by|on) [^\]]*\]\s*(?:\[voice[^\]]*\]\s*)*")   # the per-message tag, hidden in history
+
+
+# Bare thank-you (Mike 2026-11-14: "get it the same across the estate"). Same rule as the tablet and
+# phone brains (~/astrid-brain/brain.py THANKS_RE / close_kind; keep these in step): a whole-message
+# thanks gets a fixed "You're welcome." with no Claude turn, and a spoken conversation closes, unless
+# her last reply was a question in the last 2 min (then "ok thanks" is an answer and goes to Claude).
+THANKS_RE = re.compile(r"^\W*(?:(?:ok(?:ay)?|alright|all right|cool|great|perfect|awesome|got it)\W+)*"
+                       r"(?:astrid\W+)?(?:thanks?|thank you|thank ya)(?:\s+(?:so|very)\s+much|\s+a\s+lot)?"
+                       r"(?:\W+(?:astrid|that'?s (?:it|all)(?: for now)?))*\W*$", re.I)
+WELCOME = "You're welcome."
+QUESTION_FRESH_S = 120
+_last_reply = {}   # session id -> (her last reply text, time), for the question check
+
+
+def canned_thanks(message, session_id):
+    if not THANKS_RE.search(message):
+        return False
+    text, ts = _last_reply.get(resolve(session_id) if session_id else None, ("", 0.0))
+    return not (text.rstrip().endswith("?") and time.time() - ts < QUESTION_FRESH_S)
 
 
 def device_from_ua(ua):
@@ -78,6 +104,8 @@ def device_from_ua(ua):
 def message_tag(spoken, device):
     how = "spoken" if spoken else "typed"
     tail = "; your reply is read aloud" if spoken else "; read on screen"
+    if spoken and VOICEID:
+        return f"[{how} on {device} through {CHAT_USER}'s chat app{tail}]"
     return f"[{how} by {CHAT_USER} on {device} through the chat app{tail}]"
 
 
@@ -94,8 +122,12 @@ TELEGRAM_RULES = (
 
 ASTRID_FRAMING = (
     "\n\n# Astrid in the chat app\n"
-    f"This is {CHAT_USER}'s chat app, not the office tablet. It runs on {CHAT_DEVICE}. The person "
-    f"typing or speaking here is {CHAT_USER}" + ("" if CHAT_USER == "Mike" else ", not Mike") + ". "
+    f"This is {CHAT_USER}'s chat app, not the office tablet. It runs on {CHAT_DEVICE}. The person " +
+    (f"typing or speaking here is {CHAT_USER}" + ("" if CHAT_USER == "Mike" else ", not Mike") + ". "
+     if not VOICEID else
+     f"typing here is {CHAT_USER}" + ("" if CHAT_USER == "Mike" else ", not Mike") + ". A spoken message "
+     "(the orb) carries a voice line after its tag; anyone near the device can be heard, so Astrid's "
+     "Voice ID rules below decide who is speaking and what they may do. ") +
     "You are Astrid here too; her instructions follow, but the parts about the tablet do not apply "
     "in this chat: you are not on the tablet, you cannot hear the office or look through the office "
     "webcam from here, and you never say you live on the tablet. Your ears here are this device's "
@@ -112,6 +144,13 @@ ASTRID_FRAMING = (
     "the 'How to speak' rules exactly (emotion tag first, no markdown, lists, tables, code, paths or "
     "URLs, one to three sentences, offer detail instead of reading it, and say a short acknowledgement "
     "before any tool call).\n"
+    + ("Maps on the Pixel (Mike 2026-11-14): to open Google Maps navigation on Mike's phone, typed or "
+       "spoken, run `python3 ~/astrid-brain/navigate.py \"<place>\"` (and its stop / resume / search "
+       "forms), exactly as phone Astrid does. The Astrid Talk app picks it up within a second or two over "
+       "Tailscale on any network, Wi-Fi or cellular, opens Maps and keeps her dim mini orb on top. Never "
+       "open Maps or links on the Pixel with adb: wireless debugging is off whenever he is away from home "
+       "Wi-Fi. If Maps did not open, check that Astrid Talk is running on the phone.\n"
+       if CHAT_USER == "Mike" else "")
 )
 _hostname = os.uname().nodename.split(".")[0]
 
@@ -134,6 +173,10 @@ def system_prompt():
             prompt += ("\n\nNote: this chat runs on " + _hostname + ", not uriel. Astrid's scripts "
                        "(~/astrid-brain/remind.py, dnd.py, look.py, session.py) live on uriel; run them "
                        "over ssh as `ssh mikana@uriel python3 ~/astrid-brain/<script> ...`.\n")
+            if VOICEID:
+                prompt += ("voice.py also runs on uriel and cannot see this chat's turns: add `--device <the "
+                           "device named in the voice line>` to `voice.py setup` and `voice.py meet`, and "
+                           "`voice.py who` reports uriel's last turn, not this chat's.\n")
     if RELAY_URL:
         prompt += "\n\n" + TELEGRAM_RULES.strip() + "\n"
     return prompt
@@ -456,6 +499,8 @@ class Session:
         self.lock = threading.Lock()  # held for the whole turn
         self.last = time.time()
         self.busy = False             # background work seen at the last reaper check (agents, tools)
+        self.turn_end = 0.0           # when the last turn finished
+        self.cpu_log = collections.deque(maxlen=14)   # (time, cpu seconds, pid) every CPU_STEP_S: the last minute
         self.handoff_started = False  # one handoff per session
         self.handoff_ready = None     # (summary, t0, path) once the background summary is written
         stored = autohandoff.load_ready("chat", sid) if resume else None   # v3 (Mike 2026-11-12): survives a restart
@@ -604,8 +649,15 @@ def handoff_check(s):
 def swap_if_ready(sess):
     """At the start of a turn (lock held): a ready handoff moves the chat to a fresh session. Never while the
     old process still has background work (agents, tools) running: that would kill it."""
-    if not sess.handoff_ready or (sess.alive() and sess.busy):   # reaper's last view; deferred, never dropped
+    if not sess.handoff_ready:
         return sess, ""
+    why = busy_now(sess)          # 2026-11-15: judged now, not from a minute that held the last reply
+    if why:                       # deferred, never dropped
+        log(f"handoff swap deferred session={sess.sid[:8]}: {why}")
+        return sess, ""
+    steps = _cpu_steps(sess) if sess.alive() else []
+    quiet = (f" ({time.time() - sess.turn_end:.0f}s after the reply, CPU peak {max(steps):.2f}s over {len(steps)} steps)"
+             if steps else " (old process not running)")
     (summary, t0, path), sess.handoff_ready = sess.handoff_ready, None
     # v2 (Mike 2026-11-12): tail built now, covering everything since shortly before the summary was written
     minutes = max(autohandoff.TAIL_MIN, (time.time() - t0) / 60 + autohandoff.TAIL_MIN)
@@ -626,8 +678,83 @@ def swap_if_ready(sess):
     except OSError:
         pass
     sess.stop()
-    log(f"handoff swap {sess.sid[:8]} -> {new.sid[:8]}")
+    log(f"handoff swap {sess.sid[:8]} -> {new.sid[:8]}{quiet}")
     return new, autohandoff.first_message(body)
+
+
+def _proc_cpu(pid):
+    st = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    return (int(st[11]) + int(st[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _tool_children(pid):
+    kids = []
+    for k in open(f"/proc/{pid}/task/{pid}/children").read().split():
+        try:   # only tool commands count; MCP servers (node, python) are children for the whole life
+            if b"shell-snapshots" in open(f"/proc/{k}/cmdline", "rb").read():
+                kids.append(k)
+        except OSError:
+            pass
+    return kids
+
+
+SETTLE_S = 5          # the process is still finishing up this long after a turn's result
+AGENT_QUIET_S = 90    # a background agent's transcript written this recently counts as still working
+CPU_STEP_S = 5        # how often each live process's CPU is sampled
+CPU_HOT = 0.08        # CPU seconds per step that mean work. Measured 2026-11-15: idle 0.01-0.06 a step with a
+                      # rare 0.20 blip; a background agent streaming, 0.18-0.35 (Haiku) or 0.09-0.37 (Opus) on
+                      # every step, while its transcript went up to 79 s without a write
+
+
+def cpu_sampler():
+    while True:
+        time.sleep(CPU_STEP_S)
+        with _sessions_lock:
+            live = [s for s in _sessions.values() if s.alive()]
+        for s in live:
+            try:
+                pid = s.p.pid
+                s.cpu_log.append((time.time(), _proc_cpu(pid), pid))
+            except (OSError, ValueError, IndexError, AttributeError):
+                pass
+
+
+def _cpu_steps(s):
+    """CPU seconds per step over the last minute, counting only the time since the last reply settled."""
+    pid = s.p.pid if s.p else None
+    log_ = [x for x in list(s.cpu_log) if x[2] == pid and x[0] >= s.turn_end + SETTLE_S]
+    return [(b[1] - a[1]) * CPU_STEP_S / (b[0] - a[0]) for a, b in zip(log_, log_[1:]) if b[0] > a[0]]
+
+
+def busy_now(s):
+    """Why the old process must not be stopped right now ("" = it is safe to swap). Mike 2026-11-15: the
+    reaper's view covered the minute that held the reply just finished, so a message sent within about
+    100 s of a reply never swapped (the 182K session). Signs of real background work, checked at the swap:
+    a running tool command, a background agent's transcript still being written, or CPU in use over the last
+    minute, counting only the time since the last reply finished. Too little quiet time to tell = wait."""
+    if not s.alive():
+        return ""
+    pid, now = s.p.pid, time.time()
+    try:
+        if _tool_children(pid):
+            return "a tool command is running"
+    except OSError:
+        return ""
+    try:
+        sub = os.path.join(TRANSCRIPT_DIR, s.sid, "subagents")
+        newest = max((os.path.getmtime(os.path.join(sub, f)) for f in os.listdir(sub) if f.endswith(".jsonl")),
+                     default=0)
+        if now - newest < AGENT_QUIET_S:
+            return f"a background agent wrote {now - newest:.0f}s ago"
+    except OSError:
+        pass
+    steps = _cpu_steps(s)
+    if len(steps) < 3:
+        return f"too soon to judge ({now - s.turn_end:.0f}s after the reply)"
+    hot = sum(1 for x in steps if x > CPU_HOT)
+    if hot >= max(2, -(-len(steps) // 4)):
+        return f"CPU in use ({hot} of the last {len(steps)} {CPU_STEP_S}s steps, peak {max(steps):.2f}s)"
+    return ""
 
 
 def _proc_busy(s):
@@ -817,7 +944,9 @@ class Handler(BaseHTTPRequestHandler):
                 seg = (self.headers.get("X-Seg") or "")[:120]
                 if seg:
                     log(f"stt seg {seg}")   # why the page ended the turn (pause/done/max) + its timings
-                text = whisper_text(self.rfile.read(n))
+                pcm = self.rfile.read(n)
+                text = (chat_voice.transcribe(pcm, self.headers.get("User-Agent"), whisper_text)
+                        if VOICEID else whisper_text(pcm))
             except Exception as e:
                 log(f"stt error: {e}")
                 self.send_error(502, str(e)[:200])
@@ -870,7 +999,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-        self._run_turn(session_id, message, tag, model, effort)
+        if astrid and canned_thanks(message, session_id):
+            log(f"chat thanks session={(session_id or '-')[:8]} spoken={spoken}: fixed reply, no Claude turn")
+            if session_id:
+                _last_reply[resolve(session_id)] = (WELCOME, time.time())
+            self._sse({"type": "started", "process_started": False, "session_id": session_id})
+            self._sse({"type": "text", "text": ("[happy] " if spoken else "") + WELCOME})
+            self._sse({"type": "block_end"})
+            self._sse({"type": "done", "session_id": session_id, "is_error": False, "close": True, "canned": True})
+            return
+        vdec, vline = (chat_voice.take(message, spoken) if VOICEID else None), ""
+        if vdec:
+            act = chat_voice.before_turn(vdec, message)
+            if act[0] == "say":          # a quick setup take: same fixed replies as the brains
+                log(f"chat voice setup take session={(session_id or '-')[:8]} done={act[2]}")
+                self._sse({"type": "started", "process_started": False, "session_id": session_id})
+                self._sse({"type": "text", "text": ("[happy] " if act[2] else "[neutral] ") + act[1]})
+                self._sse({"type": "block_end"})
+                self._sse({"type": "done", "session_id": session_id, "is_error": False, "close": act[2], "canned": True})
+                return
+            vline = act[1]
+        try:
+            self._run_turn(session_id, message, tag + vline, model, effort)
+        finally:
+            if vdec:
+                chat_voice.after_turn(vdec, getattr(self, "got_result", False), vline)
 
     def _run_turn(self, session_id, message, tag, model, effort):
         """One turn in a session; every event goes through self._sse (SSE to the page, or collected for /relay)."""
@@ -924,7 +1077,9 @@ class Handler(BaseHTTPRequestHandler):
                 # NOT stop the work (Mike 2026-11-06: long jobs died when the voice agent timed out).
                 # Only an explicit POST /stop interrupts; the page reloads /history to show the result.
             sess.resume = True
-            sess.last = time.time()
+            sess.last = sess.turn_end = time.time()
+            if self.got_result:
+                _last_reply[sess.sid] = (getattr(self, "result_text", "") or "", time.time())
             log(f"chat end session={sess.sid[:8]} events={self.n_events} result={self.got_result} "
                 f"{time.time()-t0:.1f}s" + (" (client gone)" if self.client_gone else ""))
         finally:
@@ -1052,6 +1207,7 @@ if __name__ == "__main__":
         log(f"telegram relay listening on {RELAY_URL}")
     threading.Thread(target=preload_voice, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
+    threading.Thread(target=cpu_sampler, daemon=True).start()
     print(f"claude-chat: http://{HOST}:{PORT}  model={MODEL} effort={EFFORT} "
           f"cwd={WORKDIR} perms={PERMISSION_MODE} key={'on' if TOKEN else 'off'} voices={list_voices()}", flush=True)
     try:

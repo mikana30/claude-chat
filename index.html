@@ -144,7 +144,7 @@
 <script>
 const log=document.getElementById('log'),input=document.getElementById('in'),form=document.getElementById('f');
 const sendBtn=document.getElementById('send'),stopBtn=document.getElementById('stop'),newBtn=document.getElementById('new');
-let sessionId=null,controller=null;
+let sessionId=null,controller=null,turnGen=0;  // turnGen: New chat bumps it so the old turn's stream stops writing here (Mike 11/15)
 document.getElementById('appTitle').textContent=document.title||'Claude Chat';
 const gear=document.getElementById('gear'),settings=document.getElementById('settings');
 gear.addEventListener('click',()=>{const o=settings.classList.toggle('open');gear.classList.toggle('open',o);gear.setAttribute('aria-expanded',o);});
@@ -294,7 +294,9 @@ function voiceLevel(){
 }
 
 function stopAudio(){speakGen++;if(curAudio){curAudio.pause();curAudio=null;}synthTalking=false;synth.cancel();}
-function afterSpeech(){if(convo&&!listening&&!sendBtn.disabled)startListening();}
+// closeAfter: a bare thank-you got the fixed "You're welcome." (server done.close); end the spoken conversation once it is said.
+let closeAfter=false;
+function afterSpeech(){if(closeAfter&&!sendBtn.disabled){closeAfter=false;if(convo)endConvo();return;}if(convo&&!listening&&!sendBtn.disabled)startListening();}
 // Split into sentence-sized chunks so the first one plays while the rest synthesize.
 function chunkText(t){
   const parts=t.match(/[^.!?\n]+(?:[.!?]+["')\]]*|\n+|$)/g)||[t];
@@ -859,7 +861,7 @@ async function send(text,items){
   // reloaded the chat, and openSession's stopAudio cut her spoken reply off after two sentences. A new turn
   // streams live, so the old watcher has nothing left to recover.
   if(lostWait){clearInterval(lostWait);lostWait=null;}
-  spReset();replyText='';
+  spReset();replyText='';closeAfter=false;
   if(convo&&!listening&&Mic.barging())Mic.stop(false);
   const meB=add('msg me',items&&items.length?text.replace(/\n\n\[Attached[\s\S]*$/,''):text);
   if(items&&items.length){const th=document.createElement('div');th.className='thumbs';
@@ -869,14 +871,14 @@ async function send(text,items){
   let ai=newBubble(),buf='',t0=Date.now(),gotDone=false;
   status(ai,'Working…');
   const tick=setInterval(()=>{if(ai.classList.contains('status')){const s=Math.round((Date.now()-t0)/1000);ai.textContent=ai.textContent.replace(/( · \d+s)?$/,` · ${s}s`);}},1000);
-  setBusy(true);controller=new AbortController();
+  setBusy(true);controller=new AbortController();const gen=++turnGen,mine=()=>gen===turnGen;
   try{
     const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:text,session_id:sessionId,model:modelSel.value,effort:effortSel.value,voice:convo}),signal:controller.signal});
     if(!r.ok){throw new Error('HTTP '+r.status)}
     const reader=r.body.getReader(),dec=new TextDecoder();let rest='';
     while(true){
-      const {value,done}=await reader.read();if(done)break;
+      const {value,done}=await reader.read();if(done||!mine())break;
       rest+=dec.decode(value,{stream:true});
       const parts=rest.split('\n\n');rest=parts.pop();
       for(const p of parts){
@@ -906,17 +908,19 @@ async function send(text,items){
           gotDone=true;
           if(ev.session_id){sessionId=ev.session_id;try{localStorage.setItem('claude-chat-session',sessionId)}catch(e){}}
           if(ev.is_error&&ev.error){add('error',ev.error);}
+          if(ev.close&&convo)closeAfter=true;
         }
       }
     }
-    if(gotDone) spFlush();
-    if(!gotDone) lostTurn();
-  }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else lostTurn(); }
+    if(mine()&&gotDone) spFlush();
+    if(mine()&&!gotDone) lostTurn();
+  }catch(e){ if(!mine()){} else if(e.name==='AbortError') add('sys','Stopped.'); else lostTurn(); }
   finally{
     clearInterval(tick);
+    if(!mine())return;  // left behind by New chat: it keeps running on uriel and shows under Past
     for(const el of log.querySelectorAll('.msg.ai.cursor')){el.classList.remove('cursor');if(el.classList.contains('status')||!el.textContent.trim())el.remove();}
     turnOpen=false;setBusy(false);controller=null;focusInput();
-    if(convo&&!sqBusy)startListening();  // nothing left to say (spoken already, error, stop, [silent]): go back to listening
+    if(convo&&!sqBusy){if(closeAfter){closeAfter=false;endConvo();}else startListening();}  // nothing left to say (spoken already, error, stop, [silent]): go back to listening
   }
 }
 
@@ -963,7 +967,11 @@ input.addEventListener('input',()=>{input.style.height='auto';input.style.height
 stopBtn.addEventListener('click',()=>{  // only Stop ends a turn; a dropped connection does not
   if(sessionId)fetch('/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId})}).catch(()=>{});
   if(controller)controller.abort();stopAudio();});
-newBtn.addEventListener('click',()=>{closePast();sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');focusInput();});
+newBtn.addEventListener('click',()=>{closePast();
+  // A turn still running belongs to the old chat: stop listening to it here (no /stop, so it finishes on uriel).
+  if(controller){turnGen++;controller.abort();controller=null;spReset();turnOpen=false;setBusy(false);}
+  if(lostWait){clearInterval(lostWait);lostWait=null;}
+  sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');focusInput();});
 // A chat idle for more than STALE_H hours starts fresh on open (Mike 11/4); old chats stay under Past.
 const STALE_H=4;
 try{const last=+localStorage.getItem('claude-chat-last')||0;
