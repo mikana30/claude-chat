@@ -70,6 +70,15 @@ try:
 except Exception:
     chat_voice = None
 VOICEID = bool(chat_voice and chat_voice.ENABLED)
+# shanaparity 11/18 (shadow): cross-device continuity for Shana's own chat app <-> her phone brain. Imported only
+# when this instance is Shana's, so Mike's chat app never loads it; sizes are logged, nothing is injected unless
+# ASTRID_CROSSDEV_SHANA=on.
+crossdev_shana = None
+if CHAT_USER.strip().lower() == "shana":
+    try:
+        import crossdev_shana   # noqa: E402
+    except Exception:
+        crossdev_shana = None
 TAG_RE = re.compile(r"^\[(spoken|typed) (?:by|on) [^\]]*\]\s*(?:\[voice[^\]]*\]\s*)*")   # the per-message tag, hidden in history
 
 
@@ -1051,7 +1060,12 @@ class Handler(BaseHTTPRequestHandler):
             log(f"chat start pid={sess.p.pid} session={sess.sid[:8]} new_proc={started} model={model} "
                 f"effort={effort} tag={tag.strip()[:40]!r} msg={message[:60]!r}")
             self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
-            sess.send(prefix + tag + message)
+            xpre = ""
+            if crossdev_shana is not None:   # shanaparity 11/18: Shana's instance only; sizes, never words
+                xpre, xs = crossdev_shana.chat_prefix(tag, sess.sid, fresh=bool(started))
+                if xs:
+                    log(f"crossdev-shana session={sess.sid[:8]} " + " ".join(f"{k}={v}" for k, v in xs.items()))
+            sess.send(prefix + xpre + tag + message)
             deadline = t0 + TURN_TIMEOUT_S
             while True:
                 try:
