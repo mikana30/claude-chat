@@ -5,7 +5,7 @@ Runs `claude -p` with the user's full config: all built-in tools, every MCP
 server in the user config (OpenBrain included), CLAUDE.md auto-discovery.
 Streams text deltas and tool activity to the browser as server-sent events.
 """
-import glob, hmac, io, json, os, subprocess, sys, threading, time, wave
+import glob, hmac, io, json, os, re, subprocess, sys, threading, time, urllib.error, urllib.request, wave
 from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -43,8 +43,40 @@ _voice_lock = threading.Lock()    # guards model load/unload
 _synth_lock = threading.Lock()    # piper is CPU-bound; one synthesis at a time
 
 
+# "astrid" is not a Piper model: /tts proxies it to Astrid's speech service on kali
+# (same call as ~/astrid-brain/brain.py tts()). The bearer token stays server-side.
+ASTRID = "astrid"
+ASTRID_URL = os.environ.get("ASTRID_SPEECH_URL", "http://100.87.231.86:18911")
+ASTRID_TOKEN_FILE = os.environ.get("ASTRID_SPEECH_TOKEN_FILE", os.path.expanduser("~/astrid-brain/speech.token"))
+
+
+def astrid_token():
+    try:
+        with open(ASTRID_TOKEN_FILE) as f:
+            return f.read().strip()   # strip() also drops a CRLF line ending
+    except OSError:
+        return ""
+
+
+def astrid_wav(text):
+    req = urllib.request.Request(f"{ASTRID_URL}/tts", data=json.dumps({"text": text}).encode(),
+                                 method="POST", headers={"Content-Type": "application/json",
+                                                         "Authorization": f"Bearer {astrid_token()}"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:   # message carries only the status, never the header
+        raise RuntimeError(f"astrid speech HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"astrid speech unreachable: {getattr(e, 'reason', e)}") from None
+    log(f"tts {ASTRID} {len(text)} chars {time.time()-t0:.2f}s {len(body)} bytes")
+    return body
+
+
 def list_voices():
-    return sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(VOICE_DIR, "*.onnx")))
+    piper = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(VOICE_DIR, "*.onnx")))
+    return ([ASTRID] if astrid_token() else []) + piper
 
 
 def get_voice(name):
@@ -61,6 +93,8 @@ def get_voice(name):
 
 
 def tts_wav(text, name):
+    if name == ASTRID:
+        return astrid_wav(text)
     voice = get_voice(name)
     buf = io.BytesIO()
     with _synth_lock:
@@ -79,6 +113,66 @@ def preload_voice():
 
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# ---- Past chats: this server keeps its own index of the sessions it ran (other `claude -p`
+# jobs share the same project dir, so the CLI's transcript folder alone can't tell them apart).
+# Messages are read back from the CLI's transcript, ~/.claude/projects/<cwd slug>/<id>.jsonl.
+INDEX_PATH = os.path.expanduser(f"~/.local/state/claude-chat/sessions-{PORT}.json")
+TRANSCRIPT_DIR = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", WORKDIR))
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_index_lock = threading.Lock()
+
+
+def load_index():
+    try:
+        with open(INDEX_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_session(session_id, message):
+    with _index_lock:
+        idx = load_index()
+        e = idx.setdefault(session_id, {"title": message[:80], "created": time.time()})
+        e["updated"] = time.time()
+        e["last"] = message[:80]
+        os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
+        tmp = INDEX_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(idx, f)
+        os.replace(tmp, INDEX_PATH)
+
+
+def list_sessions():
+    idx = load_index()
+    out = [dict(id=k, **v) for k, v in idx.items()
+           if os.path.exists(os.path.join(TRANSCRIPT_DIR, k + ".jsonl"))]
+    return sorted(out, key=lambda e: e.get("updated", 0), reverse=True)
+
+
+def session_history(session_id):
+    """User prompts and Claude's final reply text per turn, oldest first."""
+    msgs, reply = [], []
+    with open(os.path.join(TRANSCRIPT_DIR, session_id + ".jsonl")) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("isSidechain"):
+                continue
+            c = (e.get("message") or {}).get("content")
+            if e.get("type") == "user" and isinstance(c, str):
+                reply = []  # a hook-forced rewrite replaces the earlier draft of this turn
+                if e.get("isMeta"):
+                    continue
+                msgs.append({"role": "user", "text": c})
+                msgs.append({"role": "assistant", "text": ""})
+            elif e.get("type") == "assistant" and isinstance(c, list) and msgs:
+                reply += [b["text"] for b in c if b.get("type") == "text" and b.get("text")]
+                msgs[-1]["text"] = "\n\n".join(reply)
+    return [m for m in msgs if m["text"]]
 
 # Model list comes from Claude Code's own catalog cache, which the CLI refreshes as
 # Anthropic publishes models; read per request so new models show up without a restart.
@@ -182,8 +276,20 @@ class Handler(BaseHTTPRequestHandler):
                                    "permission_mode": PERMISSION_MODE,
                                    "models": catalog_models()}).encode(),
                        "application/json")
+        elif self.path == "/sessions":
+            self._send(json.dumps({"sessions": list_sessions()}).encode(), "application/json")
+        elif self.path == "/history":
+            sid = (parse_qs(url.query).get("id") or [""])[0]
+            if not UUID_RE.match(sid):
+                return self.send_error(400)
+            try:
+                self._send(json.dumps({"messages": session_history(sid)}).encode(), "application/json")
+            except OSError:
+                self.send_error(404)
         elif self.path == "/voices":
-            self._send(json.dumps({"voices": list_voices(), "default": DEFAULT_VOICE}).encode(),
+            voices = list_voices()
+            self._send(json.dumps({"voices": voices,
+                                   "default": ASTRID if ASTRID in voices else DEFAULT_VOICE}).encode(),
                        "application/json")
         else:
             self.send_error(404)
@@ -240,6 +346,7 @@ class Handler(BaseHTTPRequestHandler):
         self._sse({"type": "started"})
         self.n_events = 0
         self.got_result = False
+        self.message = message
         try:
             for line in proc.stdout:
                 line = line.strip()
@@ -302,6 +409,12 @@ class Handler(BaseHTTPRequestHandler):
                        "seven_day": w.get("seven_day", {}).get("utilization")})
         elif t == "result":
             self.got_result = True
+            sid = ev.get("session_id")
+            if sid and UUID_RE.match(sid):
+                try:
+                    record_session(sid, self.message)
+                except OSError as e:
+                    log(f"session index write failed: {e}")
             self._sse({"type": "done", "session_id": ev.get("session_id"),
                        "is_error": ev.get("is_error", False),
                        "duration_ms": ev.get("duration_ms"),

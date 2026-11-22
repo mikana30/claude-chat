@@ -17,6 +17,14 @@
   #settings.open{display:flex}
   #settings label{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
   [hidden]{display:none!important}
+  #past.open{background:var(--tool)}
+  #pastPanel{display:none;flex-direction:column;max-height:60dvh;overflow-y:auto;border-bottom:1px solid var(--line);background:var(--panel)}
+  #pastPanel.open{display:flex}
+  #pastPanel button{text-align:left;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:10px 16px;background:none}
+  #pastPanel button.cur{background:var(--tool)}
+  #pastPanel .t{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #pastPanel .d{display:block;font-size:12px;color:var(--muted)}
+  #pastPanel .empty{padding:12px 16px;color:var(--muted);font-size:13px}
   header h1{font-size:16px;margin:0;font-weight:600}
   .pill{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
   header .spacer{flex:1}
@@ -38,7 +46,17 @@
   form{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--panel)}
   textarea{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);min-height:44px;max-height:200px}
   #mic.listening{background:#d33;color:#fff;border-color:#d33;animation:pulse 1s infinite}
-  #voice.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  #mic.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  /* Conversation overlay: the orb, a caption and controls; shown only in conversation mode */
+  #orbWrap{position:fixed;inset:0;z-index:50;background:#03050a;display:flex;flex-direction:column;align-items:center;color:#dfe8f5}
+  #orb{position:absolute;inset:0;width:100%;height:100%;touch-action:manipulation;cursor:pointer}
+  #orbUi{position:absolute;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px 18px;padding-bottom:max(18px,env(safe-area-inset-bottom));pointer-events:none}
+  #orbState{font-size:13px;letter-spacing:.08em;text-transform:uppercase;opacity:.7}
+  #orbCap{max-width:min(680px,100%);max-height:22dvh;overflow-y:auto;text-align:center;font-size:16px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:auto}
+  #orbCap.reply{opacity:.85;font-size:15px}
+  #orbUi .orbBtns{display:flex;gap:12px;pointer-events:auto}
+  #orbUi button{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.22);color:#eef4ff;border-radius:999px;padding:10px 20px}
+  #orbTalk.listening{background:#d33;border-color:#d33}
   select.pill{font:inherit;font-size:12px;padding:3px 6px;border:1px solid var(--line);border-radius:999px;background:var(--bg);color:var(--fg)}
   #voiceSel{font:inherit;font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);max-width:140px}
   @keyframes pulse{50%{opacity:.6}}
@@ -51,6 +69,7 @@
   <h1 id="appTitle">Claude Chat</h1>
   <span class="spacer"></span>
   <button id="stop" hidden>Stop</button>
+  <button id="past" title="Past chats" aria-label="Past chats" aria-expanded="false">Past</button>
   <button id="new">New chat</button>
   <button id="gear" class="iconbtn" title="Settings" aria-label="Settings" aria-expanded="false">⚙</button>
 </header>
@@ -66,16 +85,24 @@
   <label>Effort <select id="effortSel" class="pill" title="Effort for the next message">
     <option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option>
   </select></label>
-  <button id="voice" title="Read replies aloud; with mic input, auto-sends what you say">🔊 Voice off</button>
-  <select id="voiceSel" title="Which voice reads replies"><option value="browser">Browser voice</option></select>
+  <label>Voice <select id="voiceSel" title="Which voice speaks in conversation mode"><option value="browser">Browser voice</option></select></label>
   <span class="pill" id="rl" title="Plan usage: 5-hour / 7-day windows">usage —</span>
 </div>
+<div id="pastPanel"></div>
 <div id="log"></div>
 <form id="f">
   <textarea id="in" placeholder="Message…" title="Enter to send, Shift+Enter for a new line" rows="1"></textarea>
-  <button id="mic" type="button" title="Hold a conversation by voice (Chrome)">🎤</button>
+  <button id="mic" type="button" title="Start a spoken conversation (Chrome); tap again to end">🎤</button>
   <button class="primary" id="send" type="submit">Send</button>
 </form>
+<div id="orbWrap" hidden>
+  <canvas id="orb" title="Tap to end the conversation" aria-label="End conversation" role="button"></canvas>
+  <div id="orbUi">
+    <div id="orbState" aria-live="polite"></div>
+    <div id="orbCap"></div>
+    <div class="orbBtns"><button id="orbTalk" type="button">Talk now</button><button id="orbEnd" type="button">End</button></div>
+  </div>
+</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script>
 const log=document.getElementById('log'),input=document.getElementById('in'),form=document.getElementById('f');
@@ -105,7 +132,40 @@ fetch('/config').then(r=>r.json()).then(c=>{
 }).catch(()=>{});
 modelSel.addEventListener('change',()=>{try{localStorage.setItem('claude-chat-model',modelSel.value)}catch(e){}});
 effortSel.addEventListener('change',()=>{try{localStorage.setItem('claude-chat-effort',effortSel.value)}catch(e){}});
-if(sessionId) add('sys','Resumed previous session. Click "New chat" to start fresh.');
+// ---- Past chats: list sessions this server ran, reopen one and keep going ----
+const pastBtn=document.getElementById('past'),pastPanel=document.getElementById('pastPanel');
+function whenStr(t){const d=new Date(t*1000),now=new Date();
+  return d.toDateString()===now.toDateString()?d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});}
+function closePast(){pastPanel.classList.remove('open');pastBtn.classList.remove('open');pastBtn.setAttribute('aria-expanded',false);}
+pastBtn.addEventListener('click',async()=>{
+  if(pastPanel.classList.contains('open'))return closePast();
+  pastPanel.classList.add('open');pastBtn.classList.add('open');pastBtn.setAttribute('aria-expanded',true);
+  pastPanel.innerHTML='<div class="empty">Loading…</div>';
+  try{
+    const {sessions}=await (await fetch('/sessions')).json();
+    pastPanel.innerHTML='';
+    if(!sessions.length){pastPanel.innerHTML='<div class="empty">No past chats yet.</div>';return;}
+    for(const s of sessions){
+      const b=document.createElement('button');if(s.id===sessionId)b.className='cur';
+      const t=document.createElement('span');t.className='t';t.textContent=s.title;
+      const d=document.createElement('span');d.className='d';d.textContent=whenStr(s.updated)+(s.last&&s.last!==s.title?' · '+s.last:'');
+      b.append(t,d);b.addEventListener('click',()=>{closePast();openSession(s.id);});pastPanel.appendChild(b);
+    }
+  }catch(e){pastPanel.innerHTML='<div class="empty">Could not load past chats.</div>';}
+});
+async function openSession(id){
+  if(sendBtn.disabled)return;
+  stopAudio();sessionId=id;try{localStorage.setItem('claude-chat-session',id)}catch(e){}
+  log.innerHTML='';
+  try{
+    const r=await fetch('/history?id='+encodeURIComponent(id));if(!r.ok)throw new Error('HTTP '+r.status);
+    const {messages}=await r.json();
+    for(const m of messages){if(m.role==='user')add('msg me',m.text);else{const d=document.createElement('div');d.className='msg ai';render(d,stripEmo(m.text));log.appendChild(d);}}
+    add('sys','Picked up this chat. Keep typing to continue it.');
+  }catch(e){add('sys','Resumed this chat (earlier messages could not be shown).');}
+  scroll();input.focus();
+}
+
 
 function add(cls,text){const d=document.createElement('div');d.className=cls;d.textContent=text;log.appendChild(d);scroll();return d}
 function scroll(){log.scrollTop=log.scrollHeight}
@@ -117,14 +177,19 @@ function setBusy(b){sendBtn.disabled=b;stopBtn.hidden=!b;input.disabled=b;}
 function status(el,text){el.classList.add('status');el.textContent=text;scroll();}
 function newBubble(){const d=document.createElement('div');d.className='msg ai cursor';log.appendChild(d);return d;}
 
-// ---- Voice: speech-to-text (Chrome SpeechRecognition) + text-to-speech (speechSynthesis) ----
-const micBtn=document.getElementById('mic'),voiceBtn=document.getElementById('voice');
+// ---- Voice: conversation mode. The mic starts it: listen (Chrome SpeechRecognition), auto-send,
+// speak the reply (/tts WAV or browser speechSynthesis), listen again. Tap mic/orb/End to stop. ----
+const micBtn=document.getElementById('mic');
 const synth=window.speechSynthesis||{cancel(){},speak(){},getVoices(){return[]}};
-let voiceOn=false,recog=null,listening=false,replyText='',speakGen=0,curAudio=null;
-try{voiceOn=localStorage.getItem('claude-chat-voice')==='1'}catch(e){}
-function setVoice(on){voiceOn=on;voiceBtn.textContent=on?'🔊 Voice on':'🔊 Voice off';voiceBtn.classList.toggle('on',on);try{localStorage.setItem('claude-chat-voice',on?'1':'0')}catch(e){};if(!on)stopAudio();}
-setVoice(voiceOn);
-voiceBtn.addEventListener('click',()=>setVoice(!voiceOn));
+let convo=false,recog=null,listening=false,replyText='',speakGen=0,curAudio=null,idleRounds=0,synthTalking=false;
+const orbWrap=document.getElementById('orbWrap'),orbState=document.getElementById('orbState'),orbCap=document.getElementById('orbCap');
+const orbTalk=document.getElementById('orbTalk');
+
+// Optional emotion tag at the start of a reply: [happy] [concerned] [urgent] [neutral].
+const EMO_RE=/^\s*\[(happy|concerned|urgent|neutral)\]\s*/i;
+const EMO_COL={happy:[255,201,74],concerned:[255,160,46],urgent:[255,59,59],neutral:null};
+function stripEmo(s){if(/^\s*\[[a-z]{0,12}$/i.test(s))return '';return s.replace(EMO_RE,'');}
+function emoOf(s){const m=EMO_RE.exec(s);return m?m[1].toLowerCase():null;}
 
 function stripMd(s){
   return s.replace(/```[\s\S]*?```/g,' code block omitted. ')
@@ -132,21 +197,46 @@ function stripMd(s){
           .replace(/\*\*|__/g,'').replace(/[*_]/g,'')
           .replace(/\[([^\]]+)\]\([^)]+\)/g,'$1').replace(/^[-•]\s+/gm,'');
 }
-// Voice choice: 'browser' = Chrome speechSynthesis (espeak on Linux); anything else = a Piper model served by /tts.
+// Voice choice: 'browser' = Chrome speechSynthesis; 'astrid' = Astrid's speech service (via /tts);
+// anything else = a Piper model served by /tts. The server's default (Astrid when available) wins until one is picked.
 const voiceSel=document.getElementById('voiceSel');
 let voiceName='browser';
 try{voiceName=localStorage.getItem('claude-chat-voice-name')||'browser'}catch(e){}
+function voiceLabel(v){return v==='astrid'?'Astrid':v.replace(/-medium$|-low$|-high$/,'').replace('_',' ');}
 fetch('/voices').then(r=>r.json()).then(j=>{
-  for(const v of j.voices){const o=document.createElement('option');o.value=v;o.textContent=v.replace(/-medium$|-low$|-high$/,'').replace('_',' ');voiceSel.appendChild(o);}
-  if(voiceName==='browser'&&!localStorage.getItem('claude-chat-voice-name')&&j.default&&j.voices.includes(j.default))voiceName=j.default;
+  for(const v of j.voices){const o=document.createElement('option');o.value=v;o.textContent=voiceLabel(v);voiceSel.appendChild(o);}
+  let stored=null;try{stored=localStorage.getItem('claude-chat-voice-name')}catch(e){}
+  if(!stored&&j.default&&j.voices.includes(j.default))voiceName=j.default;
   if(![...voiceSel.options].some(o=>o.value===voiceName))voiceName='browser';
   voiceSel.value=voiceName;
 }).catch(()=>{});
 voiceSel.addEventListener('change',()=>{voiceName=voiceSel.value;try{localStorage.setItem('claude-chat-voice-name',voiceName)}catch(e){};stopAudio();
   speak('This is the '+voiceSel.options[voiceSel.selectedIndex].textContent+' voice.',true);});
 
-function stopAudio(){speakGen++;if(curAudio){curAudio.pause();curAudio=null;}synth.cancel();}
-function afterSpeech(){if(voiceOn&&!listening&&!sendBtn.disabled)startListening();}
+// WebAudio analyser: WAV replies are routed through it so the orb can follow the voice's loudness.
+let actx=null,analyser=null,abuf=null;
+function unlockAudio(){  // call from a tap: browsers only start an AudioContext on a user gesture
+  try{
+    if(!actx){const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+      actx=new AC();analyser=actx.createAnalyser();analyser.fftSize=512;analyser.connect(actx.destination);abuf=new Uint8Array(analyser.fftSize);}
+    if(actx.state==='suspended')actx.resume().catch(()=>{});
+  }catch(e){actx=null;analyser=null;}
+}
+let simT0=0;
+function voiceLevel(){
+  if(curAudio&&curAudio._routed&&analyser){
+    analyser.getByteTimeDomainData(abuf);let sum=0;
+    for(let i=0;i<abuf.length;i++){const v=(abuf[i]-128)/128;sum+=v*v;}
+    return Math.min(1,Math.sqrt(sum/abuf.length)*4);
+  }
+  if(curAudio)return 0.35;   // playing but not routed (AudioContext not running): steady glow
+  if(synthTalking){const t=(performance.now()-simT0)/1000;  // browser voice gives no amplitude: gentle simulated pulse
+    return 0.3+0.2*Math.sin(t*6.3)*Math.sin(t*2.1+1)+0.08*Math.sin(t*11);}
+  return 0;
+}
+
+function stopAudio(){speakGen++;if(curAudio){curAudio.pause();curAudio=null;}synthTalking=false;synth.cancel();}
+function afterSpeech(){if(convo&&!listening&&!sendBtn.disabled)startListening();}
 // Split into sentence-sized chunks so the first one plays while the rest synthesize.
 function chunkText(t){
   const parts=t.match(/[^.!?\n]+(?:[.!?]+["')\]]*|\n+|$)/g)||[t];
@@ -158,8 +248,11 @@ function chunkText(t){
 }
 function fetchTts(text){return fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,voice:voiceName})}).then(r=>r.ok?r.blob():null).catch(()=>null);}
 function playBlob(blob){return new Promise(res=>{const a=new Audio(URL.createObjectURL(blob));curAudio=a;
+  // Only route through WebAudio when the context is running; a suspended context would mute the reply.
+  if(actx&&analyser&&actx.state==='running'){try{actx.createMediaElementSource(a).connect(analyser);a._routed=true;}catch(e){}}
+  a.onplaying=()=>{if(convo)orbSet('speaking');};
   const fin=()=>{URL.revokeObjectURL(a.src);if(curAudio===a)curAudio=null;res();};a.onended=fin;a.onerror=fin;a.play().catch(fin);});}
-async function speakPiper(t,preview){
+async function speakWav(t,preview){
   const gen=speakGen;const parts=chunkText(t);let next=fetchTts(parts[0]);
   for(let i=0;i<parts.length;i++){
     const blob=await next;if(gen!==speakGen)return;
@@ -170,39 +263,210 @@ async function speakPiper(t,preview){
   if(!preview)afterSpeech();
 }
 function speakBrowser(t,preview){
-  if(!('speechSynthesis' in window))return;
+  if(!('speechSynthesis' in window)){if(!preview)afterSpeech();return;}
   const u=new SpeechSynthesisUtterance(t);u.rate=1.05;
   const v=synth.getVoices().find(v=>/en/i.test(v.lang)&&/Google|Natural|Premium/i.test(v.name))||synth.getVoices().find(v=>/en/i.test(v.lang));
   if(v)u.voice=v;
-  if(!preview)u.onend=afterSpeech;
+  const gen=speakGen;  // a cancelled utterance fires onerror later; ignore it once newer speech has started
+  u.onstart=()=>{if(gen!==speakGen)return;synthTalking=true;simT0=performance.now();if(convo&&!preview)orbSet('speaking');};
+  u.onend=u.onerror=()=>{if(gen!==speakGen)return;synthTalking=false;if(!preview)afterSpeech();};
   synth.speak(u);
 }
+// Speaks only in conversation mode (or a voice preview). Returns true if speech started.
 function speak(text,preview){
-  if(!voiceOn&&!preview)return;
-  const t=stripMd(text).trim();if(!t)return;
+  if(!convo&&!preview)return false;
+  const emo=emoOf(text);
+  const t=stripMd(text.replace(EMO_RE,'')).trim();if(!t)return false;
   stopAudio();
-  if(voiceName==='browser')speakBrowser(t,preview);else speakPiper(t,preview);
+  if(convo&&!preview){Orb.setTint(emo?EMO_COL[emo]:null,emo==='urgent');orbCap.className='reply';orbCap.textContent=t.length>400?t.slice(0,400)+'…':t;}
+  if(voiceName==='browser')speakBrowser(t,preview);else speakWav(t,preview);
+  return true;
+}
+
+// ---- Conversation mode + overlay ----
+const ORB_LABEL={listening:'Listening',thinking:'Thinking',speaking:'Speaking'};
+function orbSet(s){Orb.setState(s);orbState.textContent=ORB_LABEL[s]||'';orbTalk.textContent=s==='listening'?'Done':'Talk now';orbTalk.classList.toggle('listening',s==='listening');}
+function startConvo(){
+  if(!SR)return;
+  convo=true;idleRounds=0;unlockAudio();
+  micBtn.classList.add('on');micBtn.title='End the spoken conversation';
+  orbWrap.hidden=false;orbCap.className='';orbCap.textContent='';Orb.start(voiceLevel);
+  if(sendBtn.disabled)orbSet('thinking');else startListening();
+}
+function endConvo(){
+  convo=false;
+  if(recog){try{recog.abort()}catch(e){}}
+  stopAudio();Orb.stop();orbWrap.hidden=true;
+  micBtn.classList.remove('on','listening');micBtn.title='Start a spoken conversation (Chrome); tap again to end';
 }
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 if(!SR){micBtn.disabled=true;micBtn.title='Speech recognition needs Chrome';}
 function startListening(){
   if(!SR||listening)return;
   stopAudio();
-  recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=false;
-  let final='';
-  recog.onresult=e=>{let interim='';for(const r of e.results){if(r.isFinal)final+=r[0].transcript;else interim+=r[0].transcript;}input.value=(final+' '+interim).trim();};
-  recog.onerror=e=>{if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
-  recog.onend=()=>{listening=false;micBtn.classList.remove('listening');recog=null;
+  // continuous: Chrome keeps listening through pauses; we end the turn after PAUSE_MS of no new words (Mike 11/4)
+  recog=new SR();recog.lang='en-US';recog.interimResults=true;recog.continuous=true;
+  let final='',fatal=false,quiet=null;
+  const PAUSE_MS=2500;
+  recog.onresult=e=>{let f='',interim='';for(const r of e.results){if(r.isFinal)f+=r[0].transcript+' ';else interim+=r[0].transcript;}
+    final=f;input.value=(final+' '+interim).replace(/\s+/g,' ').trim();orbCap.className='';orbCap.textContent=input.value;
+    clearTimeout(quiet);quiet=setTimeout(()=>{if(recog)recog.stop();},PAUSE_MS);};
+  recog.onerror=e=>{if(e.error==='not-allowed'||e.error==='service-not-allowed'||e.error==='audio-capture')fatal=true;
+    if(e.error!=='no-speech'&&e.error!=='aborted')add('error','Mic: '+e.error);};
+  recog.onend=()=>{clearTimeout(quiet);listening=false;micBtn.classList.remove('listening');recog=null;
+    if(!convo)return;
     const t=input.value.trim();
-    if(t&&final.trim()&&voiceOn&&!sendBtn.disabled){input.value='';send(t);}};
-  listening=true;micBtn.classList.add('listening');recog.start();
+    if(t&&(final.trim()||t)&&!sendBtn.disabled){idleRounds=0;input.value='';send(t);return;}
+    if(fatal){endConvo();return;}
+    // Nothing heard: keep listening a couple more rounds, then end the conversation.
+    if(++idleRounds<=2&&!sendBtn.disabled)startListening();
+    else if(!sendBtn.disabled){endConvo();add('sys','Conversation ended (nothing heard).');}
+  };
+  listening=true;micBtn.classList.add('listening');if(convo)orbSet('listening');
+  try{recog.start();}catch(e){listening=false;micBtn.classList.remove('listening');recog=null;}
 }
 function stopListening(){if(recog)recog.stop();}
-micBtn.addEventListener('click',()=>listening?stopListening():startListening());
+micBtn.addEventListener('click',()=>convo?endConvo():startConvo());
+document.getElementById('orb').addEventListener('click',endConvo);
+document.getElementById('orbEnd').addEventListener('click',endConvo);
+// "Talk now" interrupts the reply and listens; while listening, "Done" sends what was heard.
+orbTalk.addEventListener('click',()=>{unlockAudio();if(listening)stopListening();else if(!sendBtn.disabled){idleRounds=0;startListening();}});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&convo)endConvo();});
+
+// ---- The orb: a small star (port of the Astrid tablet's OrbView.java): bright core, boiling
+// corona of soft blobs, streamers, a fringe of wisps with eruptions, and random flares. ----
+const Orb=(function(){
+  const cv=document.getElementById('orb'),ctx=cv.getContext('2d');
+  const reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const RAYS=14,CORONA=24,FLARES=10,WISPS=reduce?60:110,SITES=4,STRANDS=9,SP=14,TAU=Math.PI*2;
+  const COL={idle:[42,93,143],listening:[47,230,255],thinking:[138,92,255],speaking:[207,232,255]};
+  let a=7;const seed=()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};
+  const R=Math.random,F=n=>new Float32Array(n);
+  const rayAng=F(RAYS),rayW=F(RAYS),rayF1=F(RAYS),rayF2=F(RAYS),rayP1=F(RAYS),rayP2=F(RAYS),stBorn=F(RAYS),stLife=F(RAYS);
+  const corAng=F(CORONA),corF1=F(CORONA),corF2=F(CORONA),corP1=F(CORONA),corP2=F(CORONA);
+  const wAng=F(WISPS),wTilt=F(WISPS),wW=F(WISPS),wF1=F(WISPS),wF2=F(WISPS),wP1=F(WISPS),wP2=F(WISPS);
+  const siBorn=F(SITES),siLife=F(SITES),siAng=F(SITES),siSpan=F(SITES),siN=new Int32Array(SITES);
+  const stA=[],stR=[],stB=[],stW=[],stPh=[],stPlume=[];
+  for(let s=0;s<SITES;s++){stA.push(F(STRANDS*SP));stR.push(F(STRANDS*SP));stB.push(F(STRANDS));stW.push(F(STRANDS));stPh.push(F(STRANDS));stPlume.push(new Uint8Array(STRANDS));}
+  const flBorn=F(FLARES),flLife=F(FLARES),flAng=F(FLARES),flCurl=F(FLARES),flSize=F(FLARES);
+  for(let i=0;i<RAYS;i++){rayF1[i]=.4+.8*seed();rayF2[i]=1.1+1.7*seed();rayP1[i]=TAU*seed();rayP2[i]=TAU*seed();}
+  for(let i=0;i<CORONA;i++){corAng[i]=TAU*i/CORONA+(seed()-.5)*.1;corF1[i]=.5+.9*seed();corF2[i]=1.3+2*seed();corP1[i]=TAU*seed();corP2[i]=TAU*seed();}
+  for(let i=0;i<WISPS;i++){wAng[i]=TAU*seed();wTilt[i]=(seed()-.5)*.25;wW[i]=.6+seed();wF1[i]=.3+.7*seed();wF2[i]=.9+1.5*seed();wP1[i]=TAU*seed();wP2[i]=TAU*seed();}
+  // soft blob sprite (corona + flares), rebuilt only when the colour changes
+  const spr=document.createElement('canvas');spr.width=spr.height=96;const sx=spr.getContext('2d');let sprKey='';
+  const rgba=(c,al)=>`rgba(${c[0]|0},${c[1]|0},${c[2]|0},${al})`;
+  const mix=(p,q,t)=>[p[0]+(q[0]-p[0])*t,p[1]+(q[1]-p[1])*t,p[2]+(q[2]-p[2])*t];
+  const WHITE=[255,255,255];
+  function sprite(c){const k=(c[0]|0)+','+(c[1]|0)+','+(c[2]|0);if(k===sprKey)return;sprKey=k;
+    sx.clearRect(0,0,96,96);const g=sx.createRadialGradient(48,48,0,48,48,48);
+    g.addColorStop(0,rgba(c,.69));g.addColorStop(.35,rgba(c,.5));g.addColorStop(.7,rgba(c,.19));g.addColorStop(1,rgba(c,0));
+    sx.fillStyle=g;sx.fillRect(0,0,96,96);}
+  function blob(x,y,rad,al){if(al<=0||rad<=0)return;ctx.globalAlpha=Math.min(1,al/255);ctx.drawImage(spr,x-rad,y-rad,rad*2,rad*2);}
+  const wave=(t,f1,p1,f2,p2)=>.5+.5*(.6*Math.sin(t*f1+p1)+.4*Math.sin(t*f2+p2));
+  let state='idle',from=COL.idle,to=COL.idle,fadeStart=0,urgent=false,level=0,getLevel=()=>0,tint=null;
+  let raf=0,last=0,W=0,H=0,dpr=1;const t0=performance.now();
+  function cur(now){return mix(from,to,Math.min(1,(now-fadeStart)/600));}
+  function setState(s){const now=performance.now();const c=s==='speaking'&&tint?tint:COL[s]||COL.idle;
+    if(s===state&&c===to)return;from=cur(now);to=c;fadeStart=now;state=s;}
+  function setTint(c,urg){tint=c;urgent=!!urg;if(state==='speaking'){const s=state;state='';setState(s);}}
+  function resize(){dpr=Math.min(window.devicePixelRatio||1,2);W=cv.clientWidth;H=cv.clientHeight;cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);}
+  function buildEruption(s){
+    siN[s]=3+Math.floor(R()*(STRANDS-2));const spread=siSpan[s];
+    for(let k=0;k<siN[s];k++){
+      const plume=R()<.3,a0=(R()-.5)*spread*1.6,span=(R()<.5?1:-1)*(.04+.3*R()),h=.08+.6*R()*R(),pw=.5+1.2*R();
+      const lean=(R()-.5)*.3,len=.2+.9*R(),curl=(R()-.5)*.7,kink=.01+.04*R();let kA=0,kR=0;
+      for(let j=0;j<SP;j++){const u=j/(SP-1);kA+=(R()-.5)*kink;kR+=(R()-.5)*kink;let an,rr;
+        if(plume){an=a0+curl*u*u+kA*u;rr=.95+len*u+kR*u;}
+        else{const lift=Math.sin(Math.PI*u);an=a0+span*u+lean*lift+kA*lift;rr=.95+h*Math.pow(lift,pw)+kR*lift;}
+        stA[s][k*SP+j]=an;stR[s][k*SP+j]=rr;}
+      stPlume[s][k]=plume?1:0;stB[s][k]=.35+.65*R();stW[s][k]=.5+1.7*R();stPh[s][k]=TAU*R();
+    }
+  }
+  function activity(an,rot,now){let act=0;
+    for(let s=0;s<SITES;s++){if(!siBorn[s])continue;const p=Math.min(1,(now-siBorn[s])/1000/siLife[s]);
+      const d=Math.atan2(Math.sin(an-siAng[s]-rot),Math.cos(an-siAng[s]-rot))/(siSpan[s]*2.5);act+=Math.sin(Math.PI*p)*Math.exp(-d*d);}
+    return Math.min(1,act);}
+  function frame(now){
+    raf=requestAnimationFrame(frame);
+    if(reduce&&now-last<66)return;               // reduced motion: ~15 fps, slower churn, no flares
+    const dt=last?Math.min(.1,(now-last)/1000):0;last=now;
+    const t=(now-t0)/1000*(reduce?.4:1);
+    if(cv.clientWidth!==W||cv.clientHeight!==H)resize();
+    ctx.setTransform(dpr,0,0,dpr,0,0);ctx.globalAlpha=1;ctx.clearRect(0,0,W,H);
+    const cx=W/2,cy=H*.42,base=Math.min(W,H)*.2;
+    const target=state==='speaking'?getLevel():0;
+    level+=(target-level)*(target>level?.5:.15);
+    let pulse,churn,reach,corA,rayA,flareRate,siteRate;
+    const grow=Math.min(1,(now-fadeStart)/400);
+    if(state==='listening'){pulse=1.08+.02*Math.sin(t*2.5);churn=1.2;reach=1+.3*grow;corA=70+80*grow;rayA=40+50*grow;flareRate=.5;siteRate=.3;}
+    else if(state==='thinking'){pulse=1+.04*Math.sin(t*1.4);churn=3;reach=1.15;corA=130;rayA=60;flareRate=1.3;siteRate=.6;}
+    else if(state==='speaking'){pulse=urgent?1+.45*Math.sqrt(level):1+.25*level;churn=1.5+2.5*level;reach=1+.4*level;corA=80+150*level;rayA=40+80*level;flareRate=.2+(urgent?5:3)*level*level;siteRate=.15+.6*level;}
+    else{pulse=1+.04*Math.sin(t*1.1);churn=.5;reach=1;corA=60;rayA=35;flareRate=.12;siteRate=.08;}
+    if(reduce)flareRate=0;
+    const col=cur(now),light=mix(col,WHITE,.35),r=base*pulse;
+    // core: white melting into the colour by ~3/4 out, light strong to the limb
+    const g=ctx.createRadialGradient(cx,cy,0,cx,cy,r*1.35);
+    for(let i=0;i<11;i++){const u=i/10,wh=Math.pow(Math.max(0,1-u/.75),1.5),al=u<.35?1:Math.pow((1-u)/.65,1.8);g.addColorStop(u,rgba(mix(col,WHITE,wh),al.toFixed(3)));}
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(cx,cy,r*1.35,0,TAU);ctx.fill();
+    // streamers: each lives a few seconds at a random angle, fades in and out, reborn elsewhere
+    const r0=r*.3,rayEnd=r*reach*1.65;
+    const rg=ctx.createRadialGradient(cx,cy,0,cx,cy,rayEnd);rg.addColorStop(0,rgba(light,1));rg.addColorStop(.55,rgba(light,.53));rg.addColorStop(1,rgba(light,0));
+    ctx.strokeStyle=rg;ctx.lineCap='round';
+    for(let i=0;i<RAYS;i++){let p=(now-stBorn[i])/1000/stLife[i];
+      if(!stBorn[i]||p>=1){stBorn[i]=now-(stBorn[i]?0:R()*4000);stLife[i]=(2+3*R())/Math.max(.5,churn);rayAng[i]=TAU*R();rayW[i]=.02+.04*R();p=Math.min(.99,(now-stBorn[i])/1000/stLife[i]);}
+      const env=Math.sin(Math.PI*p),n=wave(t*churn*.6,rayF1[i],rayP1[i],rayF2[i],rayP2[i]);
+      const an=rayAng[i]+.15*p,len=r*reach*(1+.6*n*env),ca=Math.cos(an),sa=Math.sin(an);
+      ctx.globalAlpha=Math.max(0,rayA*env*(.4+.6*n)/255);ctx.lineWidth=rayW[i]*(r0+len)/2;
+      ctx.beginPath();ctx.moveTo(cx+r0*ca,cy+r0*sa);ctx.lineTo(cx+len*ca,cy+len*sa);ctx.stroke();}
+    // corona: large dim overlapping blobs boiling around the core's edge
+    sprite(light);
+    const drift=(t*.04)%TAU;
+    for(let i=0;i<CORONA;i++){const n=wave(t*churn,corF1[i],corP1[i],corF2[i],corP2[i]),an=corAng[i]+(i%2?-drift:drift),d=r*reach*(.7+.3*n);
+      blob(cx+d*Math.cos(an),cy+d*Math.sin(an),r*(.35+.2*n),corA*.4*(.25+.75*n));}
+    // limb: active sites rise at random, live 8-20 s, and fade
+    const loopGain=state==='speaking'?1+.8*level:state==='listening'?1+.2*grow:1;
+    let anySite=false;for(let s=0;s<SITES;s++)if(siBorn[s])anySite=true;
+    if(!anySite||R()<siteRate*dt){for(let s=0;s<SITES;s++){if(siBorn[s])continue;siBorn[s]=now;siLife[s]=8+12*R();siAng[s]=TAU*R();siSpan[s]=.08+.2*R();buildEruption(s);break;}}
+    const rot=(t*.03)%TAU,limb=r*.62;
+    const wg=ctx.createRadialGradient(cx,cy,0,cx,cy,limb*1.9);wg.addColorStop(0,rgba(light,1));wg.addColorStop(.5,rgba(light,1));wg.addColorStop(.7,rgba(light,.44));wg.addColorStop(1,rgba(light,0));
+    ctx.strokeStyle=wg;
+    // wisps: a fine fringe all round, longer and brighter near active sites
+    ctx.lineCap='butt';
+    for(let i=0;i<WISPS;i++){const an=wAng[i]+rot,act=activity(an,rot,now),n=wave(t*churn*.5,wF1[i],wP1[i],wF2[i],wP2[i]);
+      const len=limb*reach*(.2+.3*n+.6*act),tilt=wTilt[i]+.08*Math.sin(t*.7*churn+wP1[i]),rs=limb*.85,re=rs+len,ae=an+tilt*len/limb;
+      ctx.globalAlpha=Math.min(1,corA*(.15+.4*n+.9*act)/255);ctx.lineWidth=wW[i]*(1+act)*.8;
+      ctx.beginPath();ctx.moveTo(cx+rs*Math.cos(an),cy+rs*Math.sin(an));ctx.lineTo(cx+re*Math.cos(ae),cy+re*Math.sin(ae));ctx.stroke();}
+    // eruptions: strands grow out from the limb, waver a little, and fade
+    ctx.lineCap='round';
+    for(let s=0;s<SITES;s++){if(!siBorn[s])continue;const p=(now-siBorn[s])/1000/siLife[s];if(p>=1){siBorn[s]=0;continue;}
+      const reveal=Math.min(1,p/.3),env=p<.6?1:(1-p)/.4;
+      for(let k=0;k<siN[s];k++){const o0=k*SP,segs=Math.max(1,Math.floor(reveal*(SP-1))),plume=stPlume[s][k];
+        ctx.beginPath();
+        for(let j=0;j<=segs;j++){const rel=stR[s][o0+j]-.95,rr=limb*(.95+rel*loopGain*(plume?.5+.8*p:1));
+          const an=siAng[s]+rot+stA[s][o0+j]+.012*Math.sin(t*1.7*churn+stPh[s][k]+j*.6);
+          const x=cx+rr*Math.cos(an),y=cy+rr*Math.sin(an);if(j)ctx.lineTo(x,y);else ctx.moveTo(x,y);}
+        const flick=.7+.3*Math.sin(t*3*churn+stPh[s][k]);
+        ctx.lineWidth=Math.max(.6,base*.006*stW[s][k]);ctx.globalAlpha=Math.min(1,corA*1.8*stB[s][k]*env*flick/255);ctx.stroke();}}
+    // flares: erupt at random (mostly from an active site), curl as they drift out, fade
+    if(R()<flareRate*dt){for(let i=0;i<FLARES;i++){if(flBorn[i])continue;const fast=state==='thinking';
+      flBorn[i]=now;flLife[i]=fast?.8+.6*R():1.3+R();flAng[i]=TAU*R();
+      for(let s=0;s<SITES;s++)if(siBorn[s]&&R()<.6){flAng[i]=siAng[s]+rot+(R()-.5)*.15;break;}
+      flCurl[i]=(R()-.5)*.6;flSize[i]=.6+.7*R()+(state==='speaking'?.5*level:0);break;}}
+    for(let i=0;i<FLARES;i++){if(!flBorn[i])continue;const p=(now-flBorn[i])/1000/flLife[i];if(p>=1){flBorn[i]=0;continue;}
+      const out=1-(1-p)*(1-p),fade=(1-p)*(1-p);
+      for(let k=0;k<3;k++){const q=Math.max(0,out-.08*k),an=flAng[i]+flCurl[i]*q,d=r*(.9+.85*q);
+        blob(cx+d*Math.cos(an),cy+d*Math.sin(an),r*.2*flSize[i]*(1-.25*k)*(.7+.6*p),200*fade*(1-.3*k));}}
+    ctx.globalAlpha=1;
+  }
+  function start(fn){getLevel=fn||(()=>0);if(raf)return;last=0;resize();raf=requestAnimationFrame(frame);}
+  function stop(){if(raf)cancelAnimationFrame(raf);raf=0;tint=null;urgent=false;state='idle';from=to=COL.idle;}
+  return {start,stop,setState,setTint};
+})();
 
 async function send(text){
-  stopAudio();replyText='';
+  stopAudio();replyText='';let spoke=false;
   add('msg me',text);
+  if(convo){orbSet('thinking');orbCap.className='';orbCap.textContent=text;}
   let ai=newBubble(),buf='',t0=Date.now(),gotDone=false;
   status(ai,'Working…');
   const tick=setInterval(()=>{if(ai.classList.contains('status')){const s=Math.round((Date.now()-t0)/1000);ai.textContent=ai.textContent.replace(/( · \d+s)?$/,` · ${s}s`);}},1000);
@@ -223,7 +487,7 @@ async function send(text){
         else if(ev.type==='thinking'){/* thinking stays hidden */}
         else if(ev.type==='text'){
           if(ai.classList.contains('status')){ai.classList.remove('status');ai.textContent='';}
-          buf+=ev.text;replyText+=ev.text;render(ai,buf);scroll();
+          buf+=ev.text;replyText+=ev.text;render(ai,stripEmo(buf));scroll();
         }
         else if(ev.type==='tool'){
           // Tool use stays hidden: close any text so far and show one quiet placeholder.
@@ -243,13 +507,14 @@ async function send(text){
         }
       }
     }
-    if(gotDone) speak(replyText);
+    if(gotDone) spoke=speak(replyText);
     if(!gotDone) add('error','Connection ended before Claude finished (no result event). Check the server log.');
   }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else add('error',String(e)); }
   finally{
     clearInterval(tick);
     for(const el of log.querySelectorAll('.msg.ai.cursor')){el.classList.remove('cursor');if(el.classList.contains('status')||!el.textContent.trim())el.remove();}
     setBusy(false);controller=null;input.focus();
+    if(convo&&!spoke)startListening();  // nothing to say (error, stop, empty reply): go back to listening
   }
 }
 
@@ -257,7 +522,8 @@ form.addEventListener('submit',e=>{e.preventDefault();const t=input.value.trim()
 input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
 input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,200)+'px';});
 stopBtn.addEventListener('click',()=>{if(controller)controller.abort();stopAudio();});
-newBtn.addEventListener('click',()=>{sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
+newBtn.addEventListener('click',()=>{closePast();sessionId=null;try{localStorage.removeItem('claude-chat-session')}catch(e){}log.innerHTML='';add('sys','New session.');input.focus();});
+if(sessionId) openSession(sessionId);  // after the voice globals above exist
 input.focus();
 </script>
 </body>
