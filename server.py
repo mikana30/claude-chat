@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Local web chat UI backed by the Claude Code CLI (Pro plan login).
 
+VOICE-HOLD TEST COPY (2026-11-07, staging only): a spoken turn is not read aloud as it streams. The server
+sends the turn's final text in a "final" event once the CLI's result arrives (after Stop hooks), and the page
+speaks only that. If a hook forced a rewrite, the earlier draft is never spoken. The first tool call still
+speaks "Just a moment." Children get HEDGE_GATE_VOICE_HOLD=1 so a hedge-gate v8 block asks for a full spoken
+rewrite instead of a one-sentence correction.
+
 Runs one long-lived `claude -p --input-format stream-json` per chat session, with the user's full config: all built-in tools, every MCP
 server in the user config (OpenBrain included), CLAUDE.md auto-discovery.
 Streams text deltas and tool activity to the browser as server-sent events.
@@ -328,6 +334,10 @@ def catalog_models():
 PROC_IDLE_S = int(os.environ.get("CHAT_PROC_IDLE_S", "1800"))
 PROC_MAX = int(os.environ.get("CHAT_PROC_MAX", "2"))
 TURN_TIMEOUT_S = int(os.environ.get("CHAT_TURN_TIMEOUT_S", "900"))
+# Test hooks: CHAT_EXTRA_SETTINGS = a settings file passed to every child with --settings (e.g. a Stop hook
+# pointing at a staging hedge-gate). CHAT_EVENT_LOG = append every raw CLI event (type/subtype only + text).
+EXTRA_SETTINGS = os.environ.get("CHAT_EXTRA_SETTINGS", "")
+EVENT_LOG = os.environ.get("CHAT_EVENT_LOG", "")
 EOF = object()
 
 
@@ -344,6 +354,8 @@ def build_cmd(session_id, resume, model=None, effort=None):
         "--permission-mode", PERMISSION_MODE,
         "--append-system-prompt", system_prompt(),
     ]
+    if EXTRA_SETTINGS:
+        cmd += ["--settings", EXTRA_SETTINGS]
     cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
     return cmd
 
@@ -377,6 +389,7 @@ class Session:
     def start(self, model, effort):
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)  # allow spawning from inside a Claude session
+        env["HEDGE_GATE_VOICE_HOLD"] = "1"   # this app holds speech until the final result (hedge-gate v8)
         p = subprocess.Popen(build_cmd(self.sid, self.resume, model, effort), cwd=WORKDIR, env=env,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, bufsize=1)
@@ -667,6 +680,8 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         self.n_events = 0
         self.got_result = False
+        self.seg = []          # assistant text since the last tool call / hook feedback = what gets spoken
+        self.boundaries = 0
         self.message = message
         try:
             started = sess.ensure(model, effort)
@@ -720,7 +735,33 @@ class Handler(BaseHTTPRequestHandler):
             self.client_gone = True
             log("client disconnected; the turn keeps running")
 
+    def _evlog(self, ev):
+        if not EVENT_LOG:
+            return
+        t = ev.get("type")
+        rec = {"ts": round(time.time(), 3), "type": t, "subtype": ev.get("subtype")}
+        if t == "stream_event":
+            e = ev.get("event", {})
+            rec["event"] = e.get("type")
+            if e.get("type") == "content_block_delta":
+                rec["text"] = (e.get("delta") or {}).get("text")
+            elif e.get("type") == "content_block_start":
+                rec["block"] = (e.get("content_block") or {}).get("type")
+        elif t in ("assistant", "user"):
+            c = (ev.get("message") or {}).get("content")
+            rec["content"] = c if isinstance(c, str) else [
+                {k: (str(v)[:300] if k in ("text", "content") else v) for k, v in b.items() if k in ("type", "text", "name", "content")}
+                for b in (c or []) if isinstance(b, dict)]
+            rec["isMeta"] = ev.get("isMeta")
+        elif t == "result":
+            rec["result"] = ev.get("result")
+        else:
+            rec["raw"] = json.dumps(ev)[:600]
+        with open(EVENT_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
     def _handle(self, ev):
+        self._evlog(ev)
         t = ev.get("type")
         if t == "stream_event":
             e = ev["event"]
@@ -739,11 +780,19 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse({"type": "text", "text": d["text"]})
         elif t == "assistant":
             for b in ev["message"].get("content", []):
+                if b.get("type") == "text" and b.get("text"):
+                    self.seg.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    self.seg = []
                 if b.get("type") == "tool_use":
                     self._sse({"type": "tool_input", "name": b.get("name"),
                                "input": json.dumps(b.get("input", {}))[:300]})
         elif t == "user":
-            for b in (ev.get("message", {}).get("content") or []):
+            c = (ev.get("message") or {}).get("content")
+            if isinstance(c, str) or not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in (c or [])):
+                self.seg = []          # hook feedback / nudge: the draft before it is replaced
+                self.boundaries += 1
+            for b in (ev.get("message", {}).get("content") or []) if isinstance(c, list) else []:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     c = b.get("content")
                     if isinstance(c, list):
@@ -763,6 +812,10 @@ class Handler(BaseHTTPRequestHandler):
                     record_session(sid, self.message)
                 except OSError as e:
                     log(f"session index write failed: {e}")
+            final = ev.get("result") if isinstance(ev.get("result"), str) and not ev.get("is_error") else ""
+            final = final or "\n\n".join(self.seg)
+            self._sse({"type": "final", "text": final, "segment": "\n\n".join(self.seg),
+                       "feedback_seen": self.boundaries})
             self._sse({"type": "done", "session_id": ev.get("session_id"),
                        "is_error": ev.get("is_error", False),
                        "duration_ms": ev.get("duration_ms"),

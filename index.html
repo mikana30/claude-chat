@@ -356,14 +356,19 @@ function speak(text,preview){
 // colours the orb, a tool call with nothing said yet speaks the acknowledgement, and the
 // speakable filter drops what a voice can't say (links, tags, markdown).
 const SENT_END=/[.!?](?=\s)/, ACK='Just a moment.';
+// VOICE-HOLD TEST COPY (2026-11-07): streamed text is NOT spoken; the server's "final" event (sent after Stop
+// hooks, once the turn's result arrives) is spoken instead, so a hook-forced rewrite is the only thing heard.
+// The first tool call still speaks ACK. spHeld = the final text was queued (or the turn had nothing to say).
+const HOLD=true;let spHeld=false;
 let sq=[],sqBusy=false,spBuf='',spEmo=null,spQueued=0,spCap='',turnOpen=false,spWarned=false;
 function speakable(t){
   t=t.replace(/\[(\w+)\]/g,'').replace(/https?:\/\/\S+/g,'the link');
   t=stripMd(t).replace(/[*_`#>|]+/g,'').replace(/^\s*[-•]\s*/gm,'');
   return t.replace(/\s+/g,' ').trim();
 }
-function spReset(){stopAudio();sq=[];sqBusy=false;spBuf='';spEmo=null;spQueued=0;spCap='';turnOpen=true;spWarned=false;Orb.setTint(null,false);}
-function spText(d){
+function spReset(){stopAudio();sq=[];sqBusy=false;spBuf='';spEmo=null;spQueued=0;spCap='';turnOpen=true;spWarned=false;spHeld=false;Orb.setTint(null,false);}
+function spText(d,force){
+  if(HOLD&&!force)return;   // held: spoken from the final event
   if(!convo||spEmo==='silent')return;
   spBuf+=d;
   if(spEmo===null){
@@ -379,6 +384,13 @@ function spText(d){
 function spFlush(){if(spEmo!=='silent'&&spBuf.trim())spPut(spBuf);spBuf='';}
 // Same order as the tablet (brain.py): flush what was said, then the acknowledgement only if nothing was.
 function spTool(){if(!convo||spEmo==='silent')return;spFlush();if(spQueued===0)spPut(ACK);}
+// Speak the turn's final text (after Stop hooks). The ACK, if any, keeps playing; this queues behind it.
+function spFinal(t){
+  if(spHeld)return;spHeld=true;
+  if(!convo||!t)return;
+  spBuf='';spEmo=null;
+  spText(t+' ',true);spFlush();
+}
 function spPut(t){
   t=speakable(t);if(!t)return;
   spQueued++;sq.push(t);
@@ -848,6 +860,7 @@ async function send(text,items){
         }
         else if(ev.type==='rl'){const f=Math.round((ev.five_hour||0)*100),s=Math.round((ev.seven_day||0)*100);document.getElementById('rl').textContent=`usage 5h ${f}% · 7d ${s}%`;}
         else if(ev.type==='error'){add('error',ev.text);}
+        else if(ev.type==='final'){spFinal(ev.text||'');}
         else if(ev.type==='done'){
           gotDone=true;
           if(ev.session_id){sessionId=ev.session_id;try{localStorage.setItem('claude-chat-session',sessionId)}catch(e){}}
@@ -855,7 +868,7 @@ async function send(text,items){
         }
       }
     }
-    if(gotDone) spFlush();
+    if(gotDone){if(HOLD)spFinal(buf);else spFlush();}   // HOLD fallback: no final event -> last bubble's text
     if(!gotDone) lostTurn();
   }catch(e){ if(e.name==='AbortError') add('sys','Stopped.'); else lostTurn(); }
   finally{

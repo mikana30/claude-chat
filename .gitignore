@@ -1,2 +1,25 @@
 __pycache__/
 *.pyc
+
+# --- git cleanup 2026-11-22: runtime junk, backups, secrets ---
+*.bak
+*.bak-*
+*.bak[0-9]*
+*.orig
+*.DEAD
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+__pycache__/
+*.pyc
+venv/
+.venv/
+node_modules/
+.env
+.env.*
+*.key
+*.pem
+*.token
