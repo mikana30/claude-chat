@@ -196,6 +196,21 @@ def system_prompt():
 # stored as a long-lived cookie, then the browser is redirected to a clean URL.
 TOKEN = os.environ.get("CHAT_TOKEN", "")
 COOKIE = "cc_key"
+
+# Fail closed (Mike 2026-11-22): a copy with no access key may only run on a tailnet-only address
+# (100.64.0.0/10) or with an explicit CHAT_ALLOW_NO_KEY=1. Anything else -- e.g. 127.0.0.1 behind a
+# Tailscale Funnel -- refuses to start, so a dropped CHAT_TOKEN can never open a full-permission Claude
+# to the internet.
+def _tailnet_only(host):
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host) in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return False
+
+if not TOKEN and not (_tailnet_only(HOST) or os.environ.get("CHAT_ALLOW_NO_KEY") == "1"):
+    sys.exit(f"claude-chat: refusing to start: no CHAT_TOKEN and host {HOST!r} is not tailnet-only "
+             "(set CHAT_TOKEN, or CHAT_ALLOW_NO_KEY=1 if this copy is truly private)")
 APP_NAME = os.environ.get("CHAT_APP_NAME", "Claude Chat")
 APP_ICON = os.environ.get("CHAT_APP_ICON", "")   # base name in icon/, e.g. "shana" -> shana-any-512.png
 
