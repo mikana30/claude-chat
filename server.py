@@ -329,7 +329,7 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 # ---- Past chats: this server keeps its own index of the sessions it ran (other `claude -p`
 # jobs share the same project dir, so the CLI's transcript folder alone can't tell them apart).
-# Messages are read back from the CLI's transcript, ~/.claude/projects/<cwd slug>/<id>.jsonl.
+# Messages are read back from the CLI's transcript, <config dir>/projects/<cwd slug>/<id>.jsonl.
 INDEX_PATH = os.path.expanduser(f"~/.local/state/claude-chat/sessions-{PORT}.json")
 # Photos/videos from the camera button (Mike 11/4). Photos are shrunk; videos become ~1 frame/s (no sound).
 UPLOAD_DIR = os.path.expanduser(f"~/.local/state/claude-chat/uploads-{PORT}")
@@ -361,7 +361,10 @@ def save_upload(data, ctype):
         return {"kind": "photo", "paths": [out]}
     finally:
         os.remove(raw)
-TRANSCRIPT_DIR = os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", WORKDIR))
+# The CLI writes transcripts under its config dir, which is the user's own when CLAUDE_CONFIG_DIR is set
+# (Colter's and Shana's chats). Reading Mike's ~/.claude there left Colter with no past chats (Mike 2026-11-26).
+TRANSCRIPT_DIR = os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"),
+                              "projects", re.sub(r"[^A-Za-z0-9]", "-", WORKDIR))
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _index_lock = threading.Lock()
 
