@@ -539,7 +539,7 @@ class Session:
         self.cpu_log = collections.deque(maxlen=14)   # (time, cpu seconds, pid) every CPU_STEP_S: the last minute
         self.handoff_started = False  # one handoff per session
         self.handoff_ready = None     # (summary, t0, path) once the background summary is written
-        stored = autohandoff.load_ready("chat", sid) if resume else None   # v3 (Mike 2026-11-12): survives a restart
+        stored = autohandoff.load_ready("chat", sid) if resume and autohandoff else None   # v3 (Mike 2026-11-12): survives a restart
         if stored:
             self.handoff_started, self.handoff_ready = True, tuple(stored)
 
