@@ -95,9 +95,9 @@ _last_reply = {}   # session id -> (her last reply text, time), for the question
 
 
 # Sleep command (Mike 2026-11-26: "it needs to be matched"). The brains' rule, from the one definition in
-# ~/astrid-brain/sleep_cmd.py (not a copy): a SPOKEN message that is only "go to sleep" / "we're done" (plus
-# fillers / thanks) gets a fixed "Going to sleep." with no Claude turn, then done close:true so the orb stops
-# listening. Typed messages stay ordinary turns ("we're done" can be an answer in typed chat).
+# ~/astrid-brain/sleep_cmd.py (not a copy): a SPOKEN message that is only "go to sleep" / "we're done" /
+# "that's all" (11/27) (plus fillers / thanks) gets no Claude turn and, since 11/27, no words at all (silent, Mike:
+# jobs/astrid-thatsall-20261127): just done close:true so the orb stops listening. Typed messages stay ordinary turns ("we're done" can be an answer in typed chat).
 try:
     sys.path.insert(0, os.path.expanduser("~/astrid-brain"))
     from sleep_cmd import SLEEP, is_sleep   # noqa: E402
@@ -1039,12 +1039,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         if astrid and spoken and is_sleep and is_sleep(message):
-            log(f"chat sleep session={(session_id or '-')[:8]}: fixed reply, no Claude turn, close")
+            log(f"chat sleep session={(session_id or '-')[:8]}: silent, no Claude turn, close")
             if session_id:
-                _last_reply[resolve(session_id)] = (SLEEP, time.time())
+                _last_reply[resolve(session_id)] = ("", time.time())
             self._sse({"type": "started", "process_started": False, "session_id": session_id})
-            self._sse({"type": "text", "text": "[neutral] " + SLEEP})
-            self._sse({"type": "block_end"})
             self._sse({"type": "done", "session_id": session_id, "is_error": False, "close": True, "canned": True})
             return
         if astrid and canned_thanks(message, session_id):

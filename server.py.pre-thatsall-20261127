@@ -1,0 +1,1269 @@
+#!/usr/bin/env python3
+"""Local web chat UI backed by the Claude Code CLI (Pro plan login).
+
+Runs one long-lived `claude -p --input-format stream-json` per chat session, with the user's full config: all built-in tools, every MCP
+server in the user config (OpenBrain included), CLAUDE.md auto-discovery.
+Streams text deltas and tool activity to the browser as server-sent events.
+"""
+import collections, glob, hmac, io, json, os, queue, re, subprocess, sys, threading, time, urllib.error, urllib.request, uuid, wave
+from urllib.parse import parse_qs, urlsplit
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def log(msg):
+    sys.stderr.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    sys.stderr.flush()
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
+PORT = int(os.environ.get("CHAT_PORT", "8090"))
+# Telegram relay (Mike 11/7: reply on Telegram straight into this chat conversation). A second listener on
+# the tailnet address takes POST /relay from the Telegram bridge on uriel (cc-telegram-bot, @CC_Uriel_bot),
+# guarded by a shared secret, and runs the message as a turn in the named session. Each claude process gets
+# CHAT_SESSION_ID and CHAT_RELAY_URL so `chat-telegram` can send a report the bridge routes replies back from.
+RELAY_HOST = os.environ.get("CHAT_RELAY_HOST", "")
+RELAY_PORT = int(os.environ.get("CHAT_RELAY_PORT", "8092"))
+RELAY_SECRET_FILE = os.path.expanduser(os.environ.get("CHAT_RELAY_SECRET_FILE", "~/.config/claude-chat/relay-secret"))
+RELAY_URL = f"http://{RELAY_HOST}:{RELAY_PORT}" if RELAY_HOST else ""
+MODEL = os.environ.get("CHAT_MODEL", "claude-opus-5-5")
+EFFORT = os.environ.get("CHAT_EFFORT", "medium")
+WORKDIR = os.environ.get("CHAT_CWD", os.path.expanduser("~"))
+PERMISSION_MODE = os.environ.get("CHAT_PERMISSION_MODE", "bypassPermissions")
+# Whose chat this is (Mike 11/4: "so long as we are still aware of whose chat is whose"). Each
+# instance names its owner; the prompt, the Astrid framing and the spoken tag all use it.
+CHAT_USER = os.environ.get("CHAT_USER", "Mike")
+# Where this instance runs / is used from (Mike 11/4: Astrid must know she is not on the office
+# tablet here). Each unit sets it; the browser's user agent adds phone vs computer per message.
+CHAT_DEVICE = os.environ.get("CHAT_DEVICE") or f"a computer ({os.uname().nodename.split('.')[0]})"
+APPEND_PROMPT = os.environ.get("CHAT_APPEND_PROMPT") or (
+    f"You are chatting with {CHAT_USER} through a web chat UI, not a terminal. The person "
+    f"typing or speaking here is {CHAT_USER}. "
+    "Use OpenBrain (mcp__openbrain__recall) before answering questions about prior "
+    f"work, people, or projects, and mcp__openbrain__remember when {CHAT_USER} asks you to "
+    "remember something. Keep replies conversational and short unless asked for depth."
+)
+# Conversation mode (Mike 11/4): the chat is Astrid. Her system prompt is loaded from the same
+# file her tablet brain uses, so the two never drift; a spoken message carries SPOKEN_TAG so her
+# "How to speak" rules (emotion tag, no markdown, short) apply only when the reply is read aloud.
+# CHAT_ASTRID_PROMPT=off disables this (a chat that is not Astrid, e.g. Shana's).
+ASTRID_PROMPT_FILE = os.environ.get("CHAT_ASTRID_PROMPT", os.path.expanduser("~/astrid-brain/astrid.md"))
+# Auto-handoff (Mike 2026-11-10, same as Astrid's phone brain since 11/9): once a session's context passes
+# ASTRID_HANDOFF_TOKENS (120k), the reaper has a background claude -p write a handoff (to OpenBrain too); the next
+# turn starts a fresh session whose first message carries it. The old id stays an alias of the new one, so the
+# page, the Telegram relay and /history keep working. On by default only for Mike's chat (CHAT_AUTO_HANDOFF=1/0
+# overrides): the handoff lands in Mike's OpenBrain, and Shana's chat stays private.
+AUTO_HANDOFF = os.environ.get("CHAT_AUTO_HANDOFF", "1" if os.environ.get("CHAT_USER", "Mike") == "Mike" else "0") == "1"
+HANDOFF_MODEL = os.environ.get("CHAT_HANDOFF_MODEL", "claude-opus-5-5")
+HANDOFF_EFFORT = os.environ.get("CHAT_HANDOFF_EFFORT", "medium")   # Mike 2026-11-12: medium kept after 3-scenario test (low weaker at checked/unchecked)
+autohandoff = None
+if AUTO_HANDOFF:
+    try:
+        sys.path.insert(0, os.path.expanduser("~/astrid-brain"))
+        import autohandoff   # noqa: E402  (shared with phone_brain.py)
+    except ImportError:
+        AUTO_HANDOFF = False
+HANDOFF_RE = re.compile(r"^\[Automatic handoff:.*?\[End of handoff\]\s*", re.S)
+# Voice ID (Mike 2026-11-16: same on every device). ~/astrid-brain/chat_voice.py, shared with the Go's copy.
+try:
+    sys.path.insert(0, os.path.expanduser("~/astrid-brain"))
+    import chat_voice   # noqa: E402
+except Exception:
+    chat_voice = None
+VOICEID = bool(chat_voice and chat_voice.ENABLED)
+# shanaparity 11/18 (shadow): cross-device continuity for Shana's own chat app <-> her phone brain. Imported only
+# when this instance is Shana's, so Mike's chat app never loads it; sizes are logged, nothing is injected unless
+# ASTRID_CROSSDEV_SHANA=on.
+crossdev_shana = None
+if CHAT_USER.strip().lower() == "shana":
+    try:
+        import crossdev_shana   # noqa: E402
+    except Exception:
+        crossdev_shana = None
+TAG_RE = re.compile(r"^\[(spoken|typed) (?:by|on) [^\]]*\]\s*(?:\[voice[^\]]*\]\s*)*")   # the per-message tag, hidden in history
+
+
+# Bare thank-you (Mike 2026-11-14: "get it the same across the estate"). Same rule as the tablet and
+# phone brains (~/astrid-brain/brain.py THANKS_RE / close_kind; keep these in step): a whole-message
+# thanks gets a fixed "You're welcome." with no Claude turn, and a spoken conversation closes, unless
+# her last reply was a question in the last 2 min (then "ok thanks" is an answer and goes to Claude).
+THANKS_RE = re.compile(r"^\W*(?:(?:ok(?:ay)?|alright|all right|cool|great|perfect|awesome|got it)\W+)*"
+                       r"(?:astrid\W+)?(?:thanks?|thank you|thank ya)(?:\s+(?:so|very)\s+much|\s+a\s+lot)?"
+                       r"(?:\W+(?:astrid|that'?s (?:it|all)(?: for now)?))*\W*$", re.I)
+WELCOME = "You're welcome."
+QUESTION_FRESH_S = 120
+_last_reply = {}   # session id -> (her last reply text, time), for the question check
+
+
+# Sleep command (Mike 2026-11-26: "it needs to be matched"). The brains' rule, from the one definition in
+# ~/astrid-brain/sleep_cmd.py (not a copy): a SPOKEN message that is only "go to sleep" / "we're done" (plus
+# fillers / thanks) gets a fixed "Going to sleep." with no Claude turn, then done close:true so the orb stops
+# listening. Typed messages stay ordinary turns ("we're done" can be an answer in typed chat).
+try:
+    sys.path.insert(0, os.path.expanduser("~/astrid-brain"))
+    from sleep_cmd import SLEEP, is_sleep   # noqa: E402
+except Exception as _e:
+    SLEEP, is_sleep = "Going to sleep.", None
+    print(f"sleep_cmd not loaded ({_e}); spoken sleep command off", file=sys.stderr, flush=True)
+
+
+def canned_thanks(message, session_id):
+    if not THANKS_RE.search(message):
+        return False
+    text, ts = _last_reply.get(resolve(session_id) if session_id else None, ("", 0.0))
+    return not (text.rstrip().endswith("?") and time.time() - ts < QUESTION_FRESH_S)
+
+
+def device_from_ua(ua):
+    ua = ua or ""
+    if "iPhone" in ua or "iPad" in ua:
+        return "an iPhone or iPad"
+    if "Android" in ua:
+        return "a phone" if "Mobile" in ua else "an Android tablet"
+    return "a computer"
+
+
+def message_tag(spoken, device):
+    how = "spoken" if spoken else "typed"
+    tail = "; your reply is read aloud" if spoken else "; read on screen"
+    if spoken and VOICEID:
+        return f"[{how} on {device} through {CHAT_USER}'s chat app{tail}]"
+    return f"[{how} by {CHAT_USER} on {device} through the chat app{tail}]"
+
+
+TELEGRAM_TAG = (f"[typed by {CHAT_USER} on Telegram, replying into this chat conversation; your reply is sent "
+                "back to Telegram as plain text: keep it short, no tables, no markdown headings]")
+TELEGRAM_RULES = (
+    f" A message tagged '{TELEGRAM_TAG}' came from {CHAT_USER}'s Telegram via the relay: answer in short plain "
+    "text (it is not read aloud), and he may be away from this computer. To send him a Telegram message he can "
+    "reply to straight into this conversation (a report when a background job finishes, a question), run "
+    "`chat-telegram \"text\"` (or pipe text on stdin); plain telegram-notify messages go to a different bot and "
+    "replies to them never reach this conversation."
+)
+
+
+ASTRID_FRAMING = (
+    "\n\n# Astrid in the chat app\n"
+    f"This is {CHAT_USER}'s chat app, not the office tablet. It runs on {CHAT_DEVICE}. The person " +
+    (f"typing or speaking here is {CHAT_USER}" + ("" if CHAT_USER == "Mike" else ", not Mike") + ". "
+     if not VOICEID else
+     f"typing here is {CHAT_USER}" + ("" if CHAT_USER == "Mike" else ", not Mike") + ". A spoken message "
+     "(the orb) carries a voice line after its tag; anyone near the device can be heard, so Astrid's "
+     "Voice ID rules below decide who is speaking and what they may do. ") +
+    "You are Astrid here too; her instructions follow, but the parts about the tablet do not apply "
+    "in this chat: you are not on the tablet, you cannot hear the office or look through the office "
+    "webcam from here, and you never say you live on the tablet. Your ears here are this device's "
+    f"microphone while {CHAT_USER} is in a spoken conversation (the orb); your eyes are the photos or "
+    f"videos {CHAT_USER} sends with the camera button (they arrive as image paths for you to Read). If "
+    "asked to look, ask for a photo instead. Reminders, Do Not Disturb and session control still work "
+    "(their scripts run on uriel) but a reminder is spoken on the office tablet, so say so when you set "
+    "one. Where Astrid's instructions say Mike, read the general behaviour; the person here is "
+    f"{CHAT_USER}.\n"
+    "Every message starts with a tag saying how it arrived. "
+    f"'{message_tag(False, 'a phone')}' (or 'a computer') was typed and is read on screen: answer as "
+    "normal text chat, no emotion tag, markdown as useful. "
+    f"'{message_tag(True, 'a phone')}' came in by voice and your whole reply is read aloud: follow "
+    "the 'How to speak' rules exactly (emotion tag first, no markdown, lists, tables, code, paths or "
+    "URLs, one to three sentences, offer detail instead of reading it, and say a short acknowledgement "
+    "before any tool call).\n"
+    + ("Maps on the Pixel (Mike 2026-11-14): to open Google Maps navigation on Mike's phone, typed or "
+       "spoken, run `python3 ~/astrid-brain/navigate.py \"<place>\"` (and its stop / resume / search "
+       "forms), exactly as phone Astrid does. The Astrid Talk app picks it up within a second or two over "
+       "Tailscale on any network, Wi-Fi or cellular, opens Maps and keeps her dim mini orb on top. Never "
+       "open Maps or links on the Pixel with adb: wireless debugging is off whenever he is away from home "
+       "Wi-Fi. If Maps did not open, check that Astrid Talk is running on the phone.\n"
+       if CHAT_USER == "Mike" else "")
+)
+_hostname = os.uname().nodename.split(".")[0]
+
+
+def astrid_prompt_mtime():
+    if not ASTRID_PROMPT_FILE or ASTRID_PROMPT_FILE.lower() == "off":
+        return None
+    try:
+        return os.stat(ASTRID_PROMPT_FILE).st_mtime
+    except OSError:
+        return None
+
+
+def system_prompt():
+    prompt = APPEND_PROMPT
+    if astrid_prompt_mtime() is not None:
+        with open(ASTRID_PROMPT_FILE) as f:
+            prompt += ASTRID_FRAMING + "\n" + f.read()
+        if _hostname != "uriel":
+            prompt += ("\n\nNote: this chat runs on " + _hostname + ", not uriel. Astrid's scripts "
+                       "(~/astrid-brain/remind.py, dnd.py, look.py, session.py) live on uriel; run them "
+                       "over ssh as `ssh mikana@uriel python3 ~/astrid-brain/<script> ...`.\n")
+            if VOICEID:
+                prompt += ("voice.py also runs on uriel and cannot see this chat's turns: add `--device <the "
+                           "device named in the voice line>` to `voice.py setup` and `voice.py meet`, and "
+                           "`voice.py who` reports uriel's last turn, not this chat's.\n")
+    if RELAY_URL:
+        prompt += "\n\n" + TELEGRAM_RULES.strip() + "\n"
+    return prompt
+
+
+# Optional access key. When set (e.g. a copy exposed through Tailscale Funnel),
+# every request needs the key: the first visit carries it as ?t=KEY, which is
+# stored as a long-lived cookie, then the browser is redirected to a clean URL.
+TOKEN = os.environ.get("CHAT_TOKEN", "")
+COOKIE = "cc_key"
+
+# Fail closed (Mike 2026-11-22): a copy with no access key may only run on a tailnet-only address
+# (100.64.0.0/10) or with an explicit CHAT_ALLOW_NO_KEY=1. Anything else -- e.g. 127.0.0.1 behind a
+# Tailscale Funnel -- refuses to start, so a dropped CHAT_TOKEN can never open a full-permission Claude
+# to the internet.
+def _tailnet_only(host):
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host) in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return False
+
+if not TOKEN and not (_tailnet_only(HOST) or os.environ.get("CHAT_ALLOW_NO_KEY") == "1"):
+    sys.exit(f"claude-chat: refusing to start: no CHAT_TOKEN and host {HOST!r} is not tailnet-only "
+             "(set CHAT_TOKEN, or CHAT_ALLOW_NO_KEY=1 if this copy is truly private)")
+APP_NAME = os.environ.get("CHAT_APP_NAME", "Claude Chat")
+APP_ICON = os.environ.get("CHAT_APP_ICON", "")   # base name in icon/, e.g. "shana" -> shana-any-512.png
+
+# ---- Text-to-speech: Piper (neural, local). Voices are *.onnx files in VOICE_DIR. ----
+VOICE_DIR = os.environ.get("CHAT_VOICE_DIR", os.path.expanduser("~/.local/share/piper-voices"))
+DEFAULT_VOICE = os.environ.get("CHAT_VOICE", "en_US-lessac-medium")
+_voices = {}                      # name -> PiperVoice; only the most recent one is kept
+_voice_lock = threading.Lock()    # guards model load/unload
+_synth_lock = threading.Lock()    # piper is CPU-bound; one synthesis at a time
+
+
+# "astrid" is not a Piper model: /tts proxies it to Astrid's speech service on kali
+# (same call as ~/astrid-brain/brain.py tts()). The bearer token stays server-side.
+ASTRID = "astrid"
+ASTRID_URL = os.environ.get("ASTRID_SPEECH_URL", "http://100.87.231.86:18911")
+ASTRID_TOKEN_FILE = os.environ.get("ASTRID_SPEECH_TOKEN_FILE", os.path.expanduser("~/astrid-brain/speech.token"))
+
+
+def astrid_token():
+    try:
+        with open(ASTRID_TOKEN_FILE) as f:
+            return f.read().strip()   # strip() also drops a CRLF line ending
+    except OSError:
+        return ""
+
+
+def astrid_wav(text):
+    req = urllib.request.Request(f"{ASTRID_URL}/tts", data=json.dumps({"text": text}).encode(),
+                                 method="POST", headers={"Content-Type": "application/json",
+                                                         "Authorization": f"Bearer {astrid_token()}"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:   # message carries only the status, never the header
+        raise RuntimeError(f"astrid speech HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"astrid speech unreachable: {getattr(e, 'reason', e)}") from None
+    log(f"tts {ASTRID} {len(text)} chars {time.time()-t0:.2f}s {len(body)} bytes")
+    return body
+
+
+# Speech to text: the page records 16 kHz mono PCM and /transcribe passes it to tk-whisper on uriel
+# (the Surface Go keyboard's Whisper service). The phone's own recognizer is not used (Mike 11/5).
+WHISPER_URL = os.environ.get("CHAT_WHISPER_URL", "http://100.116.82.95:8791")
+WHISPER_MAX = 16000 * 2 * 120   # tk-whisper's own cap: 2 minutes
+
+
+def whisper_text(pcm):
+    req = urllib.request.Request(f"{WHISPER_URL}/transcribe", data=pcm, method="POST",
+                                 headers={"Content-Type": "application/octet-stream"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            j = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"whisper HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"whisper unreachable: {getattr(e, 'reason', e)}") from None
+    text = (j.get("text") or "").strip()
+    log(f"stt {len(pcm) / 32000:.1f}s audio {time.time()-t0:.2f}s {len(text)} chars")
+    return text
+
+
+def list_voices():
+    piper = sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(VOICE_DIR, "*.onnx")))
+    return ([ASTRID] if astrid_token() else []) + piper
+
+
+def get_voice(name):
+    if name not in list_voices():
+        raise ValueError(f"unknown voice {name!r}")
+    with _voice_lock:
+        if name not in _voices:
+            from piper import PiperVoice
+            t0 = time.time()
+            _voices.clear()  # ~150 MB per model; keep memory flat on an 8 GB box
+            _voices[name] = PiperVoice.load(os.path.join(VOICE_DIR, name + ".onnx"))
+            log(f"tts loaded {name} in {time.time()-t0:.1f}s")
+        return _voices[name]
+
+
+def tts_wav(text, name):
+    if name == ASTRID:
+        return astrid_wav(text)
+    voice = get_voice(name)
+    buf = io.BytesIO()
+    with _synth_lock:
+        t0 = time.time()
+        with wave.open(buf, "wb") as w:
+            voice.synthesize_wav(text, w)
+        log(f"tts {name} {len(text)} chars {time.time()-t0:.2f}s")
+    return buf.getvalue()
+
+
+def preload_voice():
+    try:
+        get_voice(DEFAULT_VOICE)
+    except Exception as e:  # missing model or piper: TTS endpoint reports it per request
+        log(f"tts preload skipped: {e}")
+
+
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# ---- Past chats: this server keeps its own index of the sessions it ran (other `claude -p`
+# jobs share the same project dir, so the CLI's transcript folder alone can't tell them apart).
+# Messages are read back from the CLI's transcript, <config dir>/projects/<cwd slug>/<id>.jsonl.
+INDEX_PATH = os.path.expanduser(f"~/.local/state/claude-chat/sessions-{PORT}.json")
+# Photos/videos from the camera button (Mike 11/4). Photos are shrunk; videos become ~1 frame/s (no sound).
+UPLOAD_DIR = os.path.expanduser(f"~/.local/state/claude-chat/uploads-{PORT}")
+UPLOAD_MAX = 300 * 1024 * 1024
+VIDEO_MAX_FRAMES = 40
+
+
+def save_upload(data, ctype):
+    """Store an upload and return {"kind", "paths"}: image files Claude can Read."""
+    import secrets
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    stem = os.path.join(UPLOAD_DIR, time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3))
+    raw = stem + ".src"
+    with open(raw, "wb") as f:
+        f.write(data)
+    try:
+        if ctype.startswith("video/"):
+            os.makedirs(stem, exist_ok=True)
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", raw, "-vf",
+                            "fps=1,scale='min(1280,iw)':-2", "-frames:v", str(VIDEO_MAX_FRAMES),
+                            "-q:v", "4", os.path.join(stem, "frame-%03d.jpg")], check=True, timeout=180)
+            paths = sorted(glob.glob(os.path.join(stem, "frame-*.jpg")))
+            if not paths:
+                raise ValueError("no frames in video")
+            return {"kind": "video", "paths": paths}
+        out = stem + ".jpg"
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", raw, "-vf",
+                        "scale='min(1600,iw)':-2", "-frames:v", "1", "-q:v", "3", out], check=True, timeout=60)
+        return {"kind": "photo", "paths": [out]}
+    finally:
+        os.remove(raw)
+# The CLI writes transcripts under its config dir, which is the user's own when CLAUDE_CONFIG_DIR is set
+# (Colter's and Shana's chats). Reading Mike's ~/.claude there left Colter with no past chats (Mike 2026-11-26).
+TRANSCRIPT_DIR = os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"),
+                              "projects", re.sub(r"[^A-Za-z0-9]", "-", WORKDIR))
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_index_lock = threading.Lock()
+
+
+def load_index():
+    try:
+        with open(INDEX_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_session(session_id, message):
+    with _index_lock:
+        idx = load_index()
+        e = idx.setdefault(session_id, {"title": message[:80], "created": time.time()})
+        e["updated"] = time.time()
+        e["last"] = message[:80]
+        os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
+        tmp = INDEX_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(idx, f)
+        os.replace(tmp, INDEX_PATH)
+
+
+ALIAS_PATH = INDEX_PATH.replace(".json", "-alias.json")   # old session id -> the fresh one a handoff started
+
+
+def load_aliases():
+    try:
+        with open(ALIAS_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve(sid):
+    seen, al = set(), load_aliases()
+    while sid in al and sid not in seen:
+        seen.add(sid)
+        sid = al[sid]
+    return sid
+
+
+def add_alias(old, new):
+    with _index_lock:
+        al = load_aliases()
+        al[old] = new
+        os.makedirs(os.path.dirname(ALIAS_PATH), exist_ok=True)
+        tmp = ALIAS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(al, f)
+        os.replace(tmp, ALIAS_PATH)
+
+
+def list_sessions():
+    idx = load_index()
+    al = load_aliases()
+    out = [dict(id=k, **v) for k, v in idx.items()
+           if k not in al and os.path.exists(os.path.join(TRANSCRIPT_DIR, k + ".jsonl"))]
+    return sorted(out, key=lambda e: e.get("updated", 0), reverse=True)
+
+
+def session_history(session_id):
+    """User prompts and Claude's final reply text per turn, oldest first. A session started by an auto-handoff
+    shows the sessions before it first, then a line where the handoff happened."""
+    session_id = resolve(session_id)
+    chain = [session_id]
+    al = load_aliases()
+    back = {v: k for k, v in al.items()}
+    while chain[0] in back and back[chain[0]] not in chain:
+        chain.insert(0, back[chain[0]])
+    out = []
+    if len(chain) == 1:
+        return _one_history(session_id)        # OSError (404) for an unknown session, as before
+    for i, sid in enumerate(chain):
+        if i:
+            out.append({"role": "sys", "text": "Automatic handoff: a fresh session took over from here."})
+        try:
+            out += _one_history(sid)
+        except OSError:
+            pass
+    return out
+
+
+def _one_history(session_id):
+    msgs, reply = [], []
+    with open(os.path.join(TRANSCRIPT_DIR, session_id + ".jsonl")) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("isSidechain"):
+                continue
+            c = (e.get("message") or {}).get("content")
+            if e.get("type") == "user" and isinstance(c, str):
+                reply = []  # a hook-forced rewrite replaces the earlier draft of this turn
+                if e.get("isMeta"):
+                    continue
+                c = TAG_RE.sub("", HANDOFF_RE.sub("", c))
+                msgs.append({"role": "user", "text": c})
+                msgs.append({"role": "assistant", "text": ""})
+            elif e.get("type") == "assistant" and isinstance(c, list) and msgs:
+                reply += [b["text"] for b in c if b.get("type") == "text" and b.get("text")]
+                msgs[-1]["text"] = "\n\n".join(reply)
+    return [m for m in msgs if m["text"]]
+
+# Model list comes from Claude Code's own catalog cache, which the CLI refreshes as
+# Anthropic publishes models; read per request so new models show up without a restart.
+CATALOG_GLOB = os.path.expanduser("~/.claude/cache/model-catalog/*-cc.json")
+
+
+def catalog_models():
+    try:
+        path = max(glob.glob(CATALOG_GLOB), key=os.path.getmtime)
+        with open(path) as f:
+            models = json.load(f)["catalog"]["config"]["models"]
+        return [{"id": m["id"], "name": m.get("name") or m["id"], "section": m.get("section", "main")}
+                for m in models if m.get("id")]
+    except (ValueError, OSError, KeyError, TypeError) as e:  # no cache yet or format change: UI keeps its static list
+        log(f"model catalog unavailable: {e}")
+        return []
+
+
+# ---- Claude processes: one long-lived `claude -p --input-format stream-json` per chat session,
+# ported from Astrid's brain.py (uriel, Mike 11/3). Each turn is one user message on stdin and
+# ends at its "result" event, so the 2-4 s CLI startup is paid once per session, not per message.
+# A process is restarted with --resume (nothing forgotten) when it dies, hangs past TURN_TIMEOUT_S,
+# or the page asks for a different model/effort (those are process flags). Idle processes are
+# reaped after PROC_IDLE_S so they are not holding memory; the next turn resumes the session.
+PROC_IDLE_S = int(os.environ.get("CHAT_PROC_IDLE_S", "1800"))
+PROC_BUSY_MAX_S = int(os.environ.get("CHAT_PROC_BUSY_MAX_S", str(12 * 3600)))  # busy or not, stop after this idle
+BUSY_CPU_S = 0.5   # CPU seconds per reaper minute that count as "still working"
+PROC_MAX = int(os.environ.get("CHAT_PROC_MAX", "2"))
+TURN_TIMEOUT_S = int(os.environ.get("CHAT_TURN_TIMEOUT_S", "900"))
+CHROME = os.environ.get("CHAT_CHROME") == "1"  # Claude in Chrome; set only on Mike's service
+EOF = object()
+
+
+def build_cmd(session_id, resume, model=None, effort=None):
+    cmd = [
+        "claude", "-p",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--model", model or MODEL,
+        "--effort", effort or EFFORT,
+        "--tools", "default",
+        "--permission-mode", PERMISSION_MODE,
+        "--append-system-prompt", system_prompt(),
+    ]
+    if CHROME:
+        cmd.append("--chrome")
+    cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
+    return cmd
+
+
+class Session:
+    """One chat session and the Claude process serving it (at most one turn at a time)."""
+
+    def __init__(self, sid, resume):
+        self.sid = sid
+        self.resume = resume          # False only until the first turn has created the transcript
+        self.p = None
+        self.events = None
+        self.stderr = collections.deque(maxlen=40)
+        self.model = self.effort = None
+        self.prompt_mtime = None      # astrid.md as loaded; a change restarts the process (Astrid's rule)
+        self.lock = threading.Lock()  # held for the whole turn
+        self.last = time.time()
+        self.busy = False             # background work seen at the last reaper check (agents, tools)
+        self.turn_end = 0.0           # when the last turn finished
+        self.cpu_log = collections.deque(maxlen=14)   # (time, cpu seconds, pid) every CPU_STEP_S: the last minute
+        self.handoff_started = False  # one handoff per session
+        self.handoff_ready = None     # (summary, t0, path) once the background summary is written
+        stored = autohandoff.load_ready("chat", sid) if resume and autohandoff else None   # v3 (Mike 2026-11-12): survives a restart
+        if stored:
+            self.handoff_started, self.handoff_ready = True, tuple(stored)
+
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+    def stop(self):
+        p, self.p = self.p, None
+        if p and p.poll() is None:
+            try:
+                p.stdin.close()
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+
+    def start(self, model, effort):
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)  # allow spawning from inside a Claude session
+        env["CHAT_SESSION_ID"] = self.sid
+        if RELAY_URL:
+            env["CHAT_RELAY_URL"] = RELAY_URL
+        p = subprocess.Popen(build_cmd(self.sid, self.resume, model, effort), cwd=WORKDIR, env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, bufsize=1)
+        events = queue.Queue()
+
+        def read():
+            for line in p.stdout:
+                try:
+                    events.put(json.loads(line))
+                except ValueError:
+                    log(f"non-json stdout: {line[:200]}")
+            events.put(EOF)
+
+        def read_err():
+            for line in p.stderr:
+                self.stderr.append(line.rstrip())
+
+        threading.Thread(target=read, daemon=True).start()
+        threading.Thread(target=read_err, daemon=True).start()
+        self.p, self.events, self.model, self.effort = p, events, model, effort
+        self.prompt_mtime = astrid_prompt_mtime()
+        log(f"claude start pid={p.pid} session={self.sid[:8]} resume={self.resume} model={model} effort={effort}")
+
+    def ensure(self, model, effort):
+        """A running process with these flags. True if one was (re)started."""
+        if self.alive() and (self.model, self.effort, self.prompt_mtime) == (model, effort, astrid_prompt_mtime()):
+            return False
+        self.stop()
+        self.start(model, effort)
+        return True
+
+    def send(self, text):
+        self._write({"type": "user", "message": {"role": "user", "content": text}})
+
+    def interrupt(self):
+        """Stop the current turn (the CLI answers with a result event); the process lives on."""
+        self._write({"type": "control_request", "request_id": f"i{int(time.time()*1000)}",
+                     "request": {"subtype": "interrupt"}})
+
+    def _write(self, obj):
+        try:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass  # dead process: shows up as EOF on the queue
+
+    def drain(self):
+        while True:
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                return
+
+
+_sessions = {}                 # sid -> Session
+_sessions_lock = threading.Lock()
+
+
+def get_session(sid):
+    sid = resolve(sid) if sid else sid
+    with _sessions_lock:
+        s = _sessions.get(sid) if sid else None
+        if s is None:
+            s = Session(sid, resume=True) if sid else Session(str(uuid.uuid4()), resume=False)
+            _sessions[s.sid] = s
+        s.last = time.time()
+        idle = [o for o in _sessions.values() if o is not s and o.alive() and not o.lock.locked() and not o.busy]
+        idle.sort(key=lambda o: o.last)
+        while len(idle) + 1 > PROC_MAX and idle:      # LRU: keep memory flat on the Go
+            o = idle.pop(0)
+            log(f"claude stop (over {PROC_MAX} live) session={o.sid[:8]}")
+            o.stop()
+        return s
+
+
+USAGE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage.jsonl")
+
+
+def usage_log(rec):
+    """v2 (Mike 2026-11-12): plan-limit utilisation and per-turn tokens, to measure handoff savings for real."""
+    try:
+        with open(USAGE_LOG, "a") as f:
+            f.write(json.dumps(dict(ts=time.time(), **rec)) + "\n")
+    except OSError:
+        pass
+
+
+def handoff_check(s):
+    """Reaper, every minute: start the background summary once the context passes the limit."""
+    if not AUTO_HANDOFF or s.handoff_started or not s.resume or s.lock.locked():   # v2: only between turns
+        return
+    path = os.path.join(TRANSCRIPT_DIR, s.sid + ".jsonl")
+    tokens = autohandoff.context_tokens(path)
+    why = autohandoff.should_handoff(tokens, time.time() - s.last)   # v2 (Mike 2026-11-12): + idle past the cache
+    if not why:
+        return
+    s.handoff_started = True
+    t0 = time.time()
+    log(f"handoff start session={s.sid[:8]} tokens={tokens} why={why}")
+
+    def work():
+        try:
+            summary = autohandoff.summarize(path, "chat", HANDOFF_MODEL, HANDOFF_EFFORT)
+        except Exception as e:
+            summary = None
+            log(f"handoff error session={s.sid[:8]}: {e}")
+        if not summary:
+            log(f"handoff failed session={s.sid[:8]}; retrying in 10 min")
+            time.sleep(600)
+            s.handoff_started = False
+            return
+        s.handoff_ready = (summary, t0, path)   # v2: the verbatim tail is built at the swap, not here
+        try:
+            autohandoff.store_ready("chat", s.sid, summary, t0, path)
+        except OSError:
+            pass
+        log(f"handoff ready session={s.sid[:8]} in {time.time() - t0:.0f}s")
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def swap_if_ready(sess):
+    """At the start of a turn (lock held): a ready handoff moves the chat to a fresh session. Never while the
+    old process still has background work (agents, tools) running: that would kill it."""
+    if not sess.handoff_ready:
+        return sess, ""
+    why = busy_now(sess)          # 2026-11-15: judged now, not from a minute that held the last reply
+    if why:                       # deferred, never dropped
+        log(f"handoff swap deferred session={sess.sid[:8]}: {why}")
+        return sess, ""
+    steps = _cpu_steps(sess) if sess.alive() else []
+    quiet = (f" ({time.time() - sess.turn_end:.0f}s after the reply, CPU peak {max(steps):.2f}s over {len(steps)} steps)"
+             if steps else " (old process not running)")
+    (summary, t0, path), sess.handoff_ready = sess.handoff_ready, None
+    # v2 (Mike 2026-11-12): tail built now, covering everything since shortly before the summary was written
+    minutes = max(autohandoff.TAIL_MIN, (time.time() - t0) / 60 + autohandoff.TAIL_MIN)
+    try:
+        _, body = autohandoff.save("chat", summary, autohandoff.tail(path, minutes))
+        autohandoff.clear_ready("chat", sess.sid)
+    except Exception as e:        # never take the turn down with it; stay on the old session
+        log(f"handoff save failed session={sess.sid[:8]}: {e}")
+        return sess, ""
+    new = Session(str(uuid.uuid4()), resume=False)
+    with _sessions_lock:
+        _sessions[new.sid] = new
+    add_alias(sess.sid, new.sid)
+    try:
+        idx = load_index()
+        title = (idx.get(sess.sid) or {}).get("title", "")
+        record_session(new.sid, title or "continued")
+    except OSError:
+        pass
+    sess.stop()
+    log(f"handoff swap {sess.sid[:8]} -> {new.sid[:8]}{quiet}")
+    return new, autohandoff.first_message(body)
+
+
+def _proc_cpu(pid):
+    st = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    return (int(st[11]) + int(st[12])) / os.sysconf("SC_CLK_TCK")
+
+
+def _tool_children(pid):
+    kids = []
+    for k in open(f"/proc/{pid}/task/{pid}/children").read().split():
+        try:   # only tool commands count; MCP servers (node, python) are children for the whole life
+            if b"shell-snapshots" in open(f"/proc/{k}/cmdline", "rb").read():
+                kids.append(k)
+        except OSError:
+            pass
+    return kids
+
+
+SETTLE_S = 5          # the process is still finishing up this long after a turn's result
+AGENT_QUIET_S = 90    # a background agent's transcript written this recently counts as still working
+CPU_STEP_S = 5        # how often each live process's CPU is sampled
+CPU_HOT = 0.08        # CPU seconds per step that mean work. Measured 2026-11-15: idle 0.01-0.06 a step with a
+                      # rare 0.20 blip; a background agent streaming, 0.18-0.35 (Haiku) or 0.09-0.37 (Opus) on
+                      # every step, while its transcript went up to 79 s without a write
+
+
+def cpu_sampler():
+    while True:
+        time.sleep(CPU_STEP_S)
+        with _sessions_lock:
+            live = [s for s in _sessions.values() if s.alive()]
+        for s in live:
+            try:
+                pid = s.p.pid
+                s.cpu_log.append((time.time(), _proc_cpu(pid), pid))
+            except (OSError, ValueError, IndexError, AttributeError):
+                pass
+
+
+def _cpu_steps(s):
+    """CPU seconds per step over the last minute, counting only the time since the last reply settled."""
+    pid = s.p.pid if s.p else None
+    log_ = [x for x in list(s.cpu_log) if x[2] == pid and x[0] >= s.turn_end + SETTLE_S]
+    return [(b[1] - a[1]) * CPU_STEP_S / (b[0] - a[0]) for a, b in zip(log_, log_[1:]) if b[0] > a[0]]
+
+
+def busy_now(s):
+    """Why the old process must not be stopped right now ("" = it is safe to swap). Mike 2026-11-15: the
+    reaper's view covered the minute that held the reply just finished, so a message sent within about
+    100 s of a reply never swapped (the 182K session). Signs of real background work, checked at the swap:
+    a running tool command, a background agent's transcript still being written, or CPU in use over the last
+    minute, counting only the time since the last reply finished. Too little quiet time to tell = wait."""
+    if not s.alive():
+        return ""
+    pid, now = s.p.pid, time.time()
+    try:
+        if _tool_children(pid):
+            return "a tool command is running"
+    except OSError:
+        return ""
+    try:
+        sub = os.path.join(TRANSCRIPT_DIR, s.sid, "subagents")
+        newest = max((os.path.getmtime(os.path.join(sub, f)) for f in os.listdir(sub) if f.endswith(".jsonl")),
+                     default=0)
+        if now - newest < AGENT_QUIET_S:
+            return f"a background agent wrote {now - newest:.0f}s ago"
+    except OSError:
+        pass
+    steps = _cpu_steps(s)
+    if len(steps) < 3:
+        return f"too soon to judge ({now - s.turn_end:.0f}s after the reply)"
+    hot = sum(1 for x in steps if x > CPU_HOT)
+    if hot >= max(2, -(-len(steps) // 4)):
+        return f"CPU in use ({hot} of the last {len(steps)} {CPU_STEP_S}s steps, peak {max(steps):.2f}s)"
+    return ""
+
+
+def _proc_busy(s):
+    """True if an idle-looking session still has work going: background agents or tools.
+    Mike 11/8: the 30-min idle stop killed a background agent mid-job (the clip collector, 00:28 on the Go).
+    Signs of work: a running tool command (Claude's Bash tool: a child shell sourcing a shell-snapshot), or CPU used since the last check
+    (an agent streaming from the API keeps the process busy even with no child)."""
+    pid = s.p.pid
+    try:
+        kids = []
+        for k in open(f"/proc/{pid}/task/{pid}/children").read().split():
+            try:   # only tool commands count; MCP servers (node, python) are children for the whole life
+                if b"shell-snapshots" in open(f"/proc/{k}/cmdline", "rb").read():
+                    kids.append(k)
+            except OSError:
+                pass
+        st = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        cpu = (int(st[11]) + int(st[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return False
+    prev, s.cpu_seen = getattr(s, "cpu_seen", None), cpu
+    return bool(kids) or (prev is not None and cpu - prev > BUSY_CPU_S)
+
+
+def reaper():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _sessions_lock:
+            for s in list(_sessions.values()):
+                was = s.busy
+                s.busy = s.alive() and _proc_busy(s)
+                if s.alive() or s.resume:
+                    try:
+                        handoff_check(s)
+                    except Exception as e:
+                        log(f"handoff check error: {e}")
+                if s.busy and now - s.last > PROC_IDLE_S and now - s.last < PROC_BUSY_MAX_S:
+                    if not was:
+                        log(f"claude kept (idle {int(now - s.last)}s, background work running) session={s.sid[:8]}")
+                    continue
+                if s.alive() and now - s.last > PROC_IDLE_S and s.lock.acquire(blocking=False):
+                    try:
+                        log(f"claude stop (idle {int(now - s.last)}s) session={s.sid[:8]}")
+                        s.stop()
+                    finally:
+                        s.lock.release()
+                if not s.alive() and now - s.last > 24 * 3600:
+                    del _sessions[s.sid]
+
+
+VAD_FILES = {"ort.wasm.min.js": "text/javascript", "ort-wasm-simd-threaded.mjs": "text/javascript",
+             "ort-wasm-simd-threaded.wasm": "application/wasm", "silero_vad_v6.onnx": "application/octet-stream"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, body, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authed(self):
+        if not TOKEN:
+            return True
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE and hmac.compare_digest(v, TOKEN):
+                return True
+        return False
+
+    def _deny(self):
+        body = b"Not authorized."
+        self.send_response(401)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlsplit(self.path)
+        if TOKEN and url.path in ("/", "/index.html"):
+            t = (parse_qs(url.query).get("t") or [""])[0]
+            if t and hmac.compare_digest(t, TOKEN):
+                self.send_response(302)
+                self.send_header("Set-Cookie", f"{COOKIE}={TOKEN}; Max-Age=315360000; Path=/; "
+                                 "HttpOnly; Secure; SameSite=Lax")
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        if url.path == "/manifest.json" and APP_ICON:
+            man = {"name": APP_NAME, "short_name": APP_NAME, "start_url": "/", "scope": "/",
+                   "display": "standalone", "background_color": "#101420", "theme_color": "#101420",
+                   "icons": [{"src": f"/icon/{APP_ICON}-any-512.png", "sizes": "512x512",
+                              "type": "image/png", "purpose": "any"},
+                             {"src": f"/icon/{APP_ICON}-maskable-512.png", "sizes": "512x512",
+                              "type": "image/png", "purpose": "maskable"}]}
+            return self._send(json.dumps(man).encode(), "application/manifest+json")
+        if APP_ICON and url.path in (f"/icon/{APP_ICON}-any-512.png", f"/icon/{APP_ICON}-maskable-512.png"):
+            with open(os.path.join(HERE, url.path.lstrip("/")), "rb") as f:
+                return self._send(f.read(), "image/png")
+        if not self._authed():
+            return self._deny()
+        self.path = url.path
+        if self.path in ("/", "/index.html"):
+            with open(os.path.join(HERE, "index.html"), "rb") as f:
+                html = f.read()
+            if APP_ICON:
+                html = html.replace(b"<title>Claude Chat</title>",
+                                    f'<title>{APP_NAME}</title><link rel="manifest" href="/manifest.json">'
+                                    f'<meta name="theme-color" content="#101420">'.encode(), 1)
+            self._send(html, "text/html; charset=utf-8")
+        elif self.path.startswith("/vad/") and self.path[5:] in VAD_FILES:
+            # Speech detector for the mic (Mike 11/6: road noise kept the turn open). Fixed allowlist, cached a week.
+            with open(os.path.join(HERE, "vad", self.path[5:]), "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", VAD_FILES[self.path[5:]])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, max-age=604800")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/config":
+            self._send(json.dumps({"model": MODEL, "effort": EFFORT, "cwd": WORKDIR,
+                                   "permission_mode": PERMISSION_MODE,
+                                   "models": catalog_models()}).encode(),
+                       "application/json")
+        elif self.path == "/sessions":
+            self._send(json.dumps({"sessions": list_sessions()}).encode(), "application/json")
+        elif self.path == "/history":
+            sid = (parse_qs(url.query).get("id") or [""])[0]
+            if not UUID_RE.match(sid):
+                return self.send_error(400)
+            try:
+                cur = resolve(sid)
+                s = _sessions.get(cur)
+                self._send(json.dumps({"messages": session_history(sid), "session_id": cur,
+                                       "busy": bool(s and s.lock.locked())}).encode(), "application/json")
+            except OSError:
+                self.send_error(404)
+        elif self.path == "/voices":
+            voices = list_voices()
+            self._send(json.dumps({"voices": voices,
+                                   "default": ASTRID if ASTRID in voices else DEFAULT_VOICE}).encode(),
+                       "application/json")
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not self._authed():
+            return self._deny()
+        if self.path == "/stop":
+            try:
+                sid = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}").get("session_id")
+            except ValueError:
+                sid = None
+            s = _sessions.get(resolve(sid)) if sid else None
+            if s and s.lock.locked():
+                s.interrupt()
+                log(f"stop requested session={s.sid[:8]}")
+            self._send(b'{"ok":true}', "application/json")
+            return
+        if self.path == "/miclog":   # one line per listening round from the page (Mike 11/6: find why the orb closed)
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 2048:
+                try:
+                    d = json.loads(self.rfile.read(n))
+                    log("mic " + " ".join(f"{k}={str(v)[:60]}" for k, v in list(d.items())[:20]))
+                except ValueError:
+                    pass
+            self._send(b'{"ok":true}', "application/json")
+            return
+        if self.path not in ("/chat", "/tts", "/upload", "/transcribe"):
+            self.send_error(404)
+            return
+        n = int(self.headers.get("Content-Length", "0"))
+        if self.path == "/transcribe":
+            if not 0 < n <= WHISPER_MAX:
+                self.send_error(400)
+                return
+            try:
+                seg = (self.headers.get("X-Seg") or "")[:120]
+                if seg:
+                    log(f"stt seg {seg}")   # why the page ended the turn (pause/done/max) + its timings
+                pcm = self.rfile.read(n)
+                text = (chat_voice.transcribe(pcm, self.headers.get("User-Agent"), whisper_text)
+                        if VOICEID else whisper_text(pcm))
+            except Exception as e:
+                log(f"stt error: {e}")
+                self.send_error(502, str(e)[:200])
+                return
+            return self._send(json.dumps({"text": text}).encode(), "application/json")
+        if self.path == "/upload":
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not (ctype.startswith("image/") or ctype.startswith("video/")) or not 0 < n <= UPLOAD_MAX:
+                self.send_error(400)
+                return
+            try:
+                res = save_upload(self.rfile.read(n), ctype)
+            except Exception as e:
+                log(f"upload error: {e}")
+                self.send_error(422, "Could not read that file")
+                return
+            log(f"upload {res['kind']} {len(res['paths'])} image(s)")
+            return self._send(json.dumps(res).encode(), "application/json")
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            self.send_error(400)
+            return
+        if self.path == "/tts":
+            text = (req.get("text") or "").strip()[:2000]
+            if not text:
+                self.send_error(400)
+                return
+            try:
+                self._send(tts_wav(text, req.get("voice") or DEFAULT_VOICE), "audio/wav")
+            except Exception as e:
+                log(f"tts error: {e}")
+                self.send_error(500, str(e)[:200])
+            return
+        message = (req.get("message") or "").strip()
+        session_id = req.get("session_id") or None
+        model = (req.get("model") or "").strip() or None
+        effort = (req.get("effort") or "").strip() or None
+        astrid = astrid_prompt_mtime() is not None
+        spoken = bool(req.get("voice")) and astrid
+        tag = message_tag(spoken, device_from_ua(self.headers.get("User-Agent"))) + " " if astrid else ""
+        if not message or (effort and effort not in EFFORTS) \
+                or (model and not model.replace("-", "").replace(".", "").isalnum()):
+            self.send_error(400)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        if astrid and spoken and is_sleep and is_sleep(message):
+            log(f"chat sleep session={(session_id or '-')[:8]}: fixed reply, no Claude turn, close")
+            if session_id:
+                _last_reply[resolve(session_id)] = (SLEEP, time.time())
+            self._sse({"type": "started", "process_started": False, "session_id": session_id})
+            self._sse({"type": "text", "text": "[neutral] " + SLEEP})
+            self._sse({"type": "block_end"})
+            self._sse({"type": "done", "session_id": session_id, "is_error": False, "close": True, "canned": True})
+            return
+        if astrid and canned_thanks(message, session_id):
+            log(f"chat thanks session={(session_id or '-')[:8]} spoken={spoken}: fixed reply, no Claude turn")
+            if session_id:
+                _last_reply[resolve(session_id)] = (WELCOME, time.time())
+            self._sse({"type": "started", "process_started": False, "session_id": session_id})
+            self._sse({"type": "text", "text": ("[happy] " if spoken else "") + WELCOME})
+            self._sse({"type": "block_end"})
+            self._sse({"type": "done", "session_id": session_id, "is_error": False, "close": True, "canned": True})
+            return
+        vdec, vline = (chat_voice.take(message, spoken) if VOICEID else None), ""
+        if vdec:
+            act = chat_voice.before_turn(vdec, message)
+            if act[0] == "say":          # a quick setup take: same fixed replies as the brains
+                log(f"chat voice setup take session={(session_id or '-')[:8]} done={act[2]}")
+                self._sse({"type": "started", "process_started": False, "session_id": session_id})
+                self._sse({"type": "text", "text": ("[happy] " if act[2] else "[neutral] ") + act[1]})
+                self._sse({"type": "block_end"})
+                self._sse({"type": "done", "session_id": session_id, "is_error": False, "close": act[2], "canned": True})
+                return
+            vline = act[1]
+        try:
+            self._run_turn(session_id, message, tag + vline, model, effort)
+        finally:
+            if vdec:
+                chat_voice.after_turn(vdec, getattr(self, "got_result", False), vline)
+
+    def _run_turn(self, session_id, message, tag, model, effort):
+        """One turn in a session; every event goes through self._sse (SSE to the page, or collected for /relay)."""
+        sess = get_session(session_id)
+        model, effort = model or MODEL, effort or EFFORT
+        waited = time.time()
+        while not sess.lock.acquire(timeout=5):   # previous turn still running (maybe in the background)
+            self._sse({"type": "status", "text": "Finishing the previous message first…"})
+            if self.client_gone or time.time() - waited > TURN_TIMEOUT_S:
+                return
+        t0 = time.time()
+        self.n_events = 0
+        self.got_result = False
+        self.message = message
+        prefix = ""
+        if sess.handoff_ready:
+            old = sess
+            sess, prefix = swap_if_ready(old)
+            if sess is not old:
+                old.lock.release()
+                sess.lock.acquire()
+        try:
+            started = sess.ensure(model, effort)
+            sess.drain()
+            log(f"chat start pid={sess.p.pid} session={sess.sid[:8]} new_proc={started} model={model} "
+                f"effort={effort} tag={tag.strip()[:40]!r} msg={message[:60]!r}")
+            self._sse({"type": "started", "process_started": started, "session_id": sess.sid})
+            xpre = ""
+            if crossdev_shana is not None:   # shanaparity 11/18: Shana's instance only; sizes, never words
+                xpre, xs = crossdev_shana.chat_prefix(tag, sess.sid, fresh=bool(started))
+                if xs:
+                    log(f"crossdev-shana session={sess.sid[:8]} " + " ".join(f"{k}={v}" for k, v in xs.items()))
+            sess.send(prefix + xpre + tag + message)
+            deadline = t0 + TURN_TIMEOUT_S
+            while True:
+                try:
+                    ev = sess.events.get(timeout=max(0.1, deadline - time.time()))
+                except queue.Empty:
+                    log(f"chat timeout session={sess.sid[:8]} after {TURN_TIMEOUT_S}s; stopping process")
+                    sess.stop()                 # next turn restarts it with --resume
+                    self._sse({"type": "error", "text": f"claude timed out after {TURN_TIMEOUT_S} s"})
+                    break
+                if ev is EOF:
+                    err = "\n".join(sess.stderr).strip()
+                    rc = sess.p.poll() if sess.p else None
+                    log(f"claude exited pid={sess.p and sess.p.pid} rc={rc} session={sess.sid[:8]} stderr={err[-300:]!r}")
+                    sess.stop()
+                    if not self.got_result:
+                        self._sse({"type": "error", "text": err[-800:] or f"claude exited {rc} without a result"})
+                    break
+                self.n_events += 1
+                self._handle(ev)
+                if ev.get("type") == "result":
+                    break
+                # A dropped connection (phone screen off, voice conversation over, page reloaded) does
+                # NOT stop the work (Mike 2026-11-06: long jobs died when the voice agent timed out).
+                # Only an explicit POST /stop interrupts; the page reloads /history to show the result.
+            sess.resume = True
+            sess.last = sess.turn_end = time.time()
+            if self.got_result:
+                _last_reply[sess.sid] = (getattr(self, "result_text", "") or "", time.time())
+            log(f"chat end session={sess.sid[:8]} events={self.n_events} result={self.got_result} "
+                f"{time.time()-t0:.1f}s" + (" (client gone)" if self.client_gone else ""))
+        finally:
+            sess.lock.release()
+
+    client_gone = False
+
+    def _sse(self, obj):
+        # Navigating away or losing the connection never stops the turn; the Stop button
+        # (POST /stop) interrupts it and keeps the process ready for the next message.
+        if self.client_gone:
+            return
+        try:
+            self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
+            log("client disconnected; the turn keeps running")
+
+    def _handle(self, ev):
+        t = ev.get("type")
+        if t == "stream_event":
+            e = ev["event"]
+            et = e.get("type")
+            if et == "content_block_start":
+                cb = e["content_block"]
+                if cb["type"] == "tool_use":
+                    self._sse({"type": "tool", "name": cb.get("name", "?")})
+                elif cb["type"] == "thinking":
+                    self._sse({"type": "thinking"})
+            elif et == "content_block_stop":
+                self._sse({"type": "block_end"})   # page flushes speech here, as the tablet does
+            elif et == "content_block_delta":
+                d = e["delta"]
+                if d["type"] == "text_delta":
+                    self._sse({"type": "text", "text": d["text"]})
+        elif t == "assistant":
+            for b in ev["message"].get("content", []):
+                if b.get("type") == "tool_use":
+                    self._sse({"type": "tool_input", "name": b.get("name"),
+                               "input": json.dumps(b.get("input", {}))[:300]})
+        elif t == "user":
+            for b in (ev.get("message", {}).get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    c = b.get("content")
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                    self._sse({"type": "tool_result", "is_error": bool(b.get("is_error")),
+                               "text": (str(c) if c is not None else "")[:300]})
+        elif t == "rate_limit_event":
+            w = ev.get("rate_limit_info", {}).get("unifiedWindows", {})
+            usage_log({"ev": "rl", "sid": ev.get("session_id"),
+                       "five_hour": w.get("five_hour", {}).get("utilization"),
+                       "seven_day": w.get("seven_day", {}).get("utilization")})
+            self._sse({"type": "rl",
+                       "five_hour": w.get("five_hour", {}).get("utilization"),
+                       "seven_day": w.get("seven_day", {}).get("utilization")})
+        elif t == "result":
+            self.got_result = True
+            sid = ev.get("session_id")
+            usage_log({"ev": "turn", "sid": sid, "usage": ev.get("usage"), "num_turns": ev.get("num_turns"),
+                       "duration_ms": ev.get("duration_ms")})
+            if sid and UUID_RE.match(sid):
+                try:
+                    record_session(sid, self.message)
+                except OSError as e:
+                    log(f"session index write failed: {e}")
+            self.result_text = ev.get("result") or ""
+            self._sse({"type": "done", "session_id": ev.get("session_id"),
+                       "is_error": ev.get("is_error", False),
+                       "duration_ms": ev.get("duration_ms"),
+                       "num_turns": ev.get("num_turns"),
+                       "error": ev.get("result") if ev.get("is_error") else None})
+
+
+class RelayHandler(Handler):
+    """POST /relay from the Telegram bridge: {"session_id", "message"} + X-Relay-Secret.
+    Runs the message as a turn in that session and answers {"text": reply} when the turn ends."""
+
+    def do_GET(self):
+        self.send_error(404)
+
+    def _sse(self, obj):
+        t = obj.get("type")
+        if t == "text":
+            self.parts.append(obj["text"])
+        elif t == "block_end" and self.parts and not self.parts[-1].endswith("\n\n"):
+            self.parts.append("\n\n")
+        elif t == "error":
+            self.err = obj.get("text") or "error"
+        elif t == "status":
+            self.waited_note = obj.get("text")
+
+    def do_POST(self):
+        secret = ""
+        try:
+            secret = open(RELAY_SECRET_FILE).read().strip()
+        except OSError:
+            pass
+        if self.path != "/relay" or not secret or not hmac.compare_digest(self.headers.get("X-Relay-Secret", ""), secret):
+            return self._deny()
+        try:
+            req = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 200000)) or b"{}")
+        except ValueError:
+            return self.send_error(400)
+        sid, message = req.get("session_id") or "", (req.get("message") or "").strip()
+        if not UUID_RE.match(sid) or not message:
+            return self.send_error(400)
+        self.parts, self.err, self.waited_note, self.result_text = [], None, None, ""
+        astrid = astrid_prompt_mtime() is not None
+        log(f"relay from {self.client_address[0]} session={sid[:8]} msg={message[:60]!r}")
+        self._run_turn(sid, message, TELEGRAM_TAG + " " if astrid else "", None, None)
+        text = "".join(self.parts).strip() or self.result_text.strip()
+        body = json.dumps({"text": text, "error": self.err}).encode()
+        self._send(body, "application/json")
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv.daemon_threads = True
+    if RELAY_HOST:
+        rsrv = ThreadingHTTPServer((RELAY_HOST, RELAY_PORT), RelayHandler)
+        rsrv.daemon_threads = True
+        threading.Thread(target=rsrv.serve_forever, daemon=True).start()
+        log(f"telegram relay listening on {RELAY_URL}")
+    threading.Thread(target=preload_voice, daemon=True).start()
+    threading.Thread(target=reaper, daemon=True).start()
+    threading.Thread(target=cpu_sampler, daemon=True).start()
+    print(f"claude-chat: http://{HOST}:{PORT}  model={MODEL} effort={EFFORT} "
+          f"cwd={WORKDIR} perms={PERMISSION_MODE} key={'on' if TOKEN else 'off'} voices={list_voices()}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
